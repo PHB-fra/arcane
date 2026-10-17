@@ -3,7 +3,7 @@
 // Server releases (a Windows host can only build for its own release or older
 // ones under Hyper-V isolation).
 //
-//	windows-image build -base mcr.microsoft.com/windows/nanoserver:1809 -exe arcane-agent.exe -tag ghcr.io/o/i:t -out i.tar
+//	windows-image build -base mcr.microsoft.com/windows/nanoserver:1809 -exe arcane-agent.exe -tag ghcr.io/o/i:t -out i.tar [-load-out i-load.tar]
 //	windows-image push -tar i.tar -tag ghcr.io/o/i:t [-tag ghcr.io/o/i:t2]
 //	windows-image index -tag ghcr.io/o/i:multi -from ghcr.io/o/i:a -from ghcr.io/o/i:b
 package main
@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
+	legacytarball "github.com/google/go-containerregistry/pkg/legacy/tarball"
 	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
@@ -57,7 +58,8 @@ func build(args []string) {
 	base := fs.String("base", "mcr.microsoft.com/windows/nanoserver:ltsc2022", "Windows base image")
 	exe := fs.String("exe", "out/arcane-agent.exe", "agent built for windows/amd64")
 	tag := fs.String("tag", "arcane-agent-windows:dev", "image name stored in the tarball")
-	out := fs.String("out", "image.tar", "output tarball (docker load format)")
+	out := fs.String("out", "image.tar", "output tarball, read back by push")
+	loadOut := fs.String("load-out", "", "optional legacy tarball for docker load on Windows")
 	var labels repeated
 	fs.Var(&labels, "label", "extra key=value label (repeatable)")
 	_ = fs.Parse(args)
@@ -126,6 +128,13 @@ func build(args []string) {
 	}
 	if err := tarball.WriteToFile(*out, ref, img); err != nil {
 		log.Fatalf("write %s: %v", *out, err)
+	}
+	// The default tarball names the config "sha256:<hex>", which docker load rejects
+	// on Windows because ':' is not allowed in file names; the legacy format does not.
+	if *loadOut != "" {
+		if err := writeLegacy(*loadOut, ref, img); err != nil {
+			log.Fatalf("write %s: %v", *loadOut, err)
+		}
 	}
 	cfgFile, _ = img.ConfigFile()
 	digest, _ := img.Digest()
@@ -209,6 +218,18 @@ func index(args []string) {
 	digest, _ := idx.Digest()
 	fmt.Printf("pushed %s@%s\n", *tag, digest)
 	setOutput("digest", digest.String())
+}
+
+func writeLegacy(path string, ref name.Reference, img v1.Image) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := legacytarball.Write(ref, img, f); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // layerTarball writes app/arcane-agent.exe and an empty app/data/ to a temporary tar.
