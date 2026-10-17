@@ -47,6 +47,19 @@ jobs:
           "VERSION=$($meta.version)" >> $env:GITHUB_ENV
           "TAG=$($meta.version)-ltsc2022-preview" >> $env:GITHUB_ENV
 
+      - name: Start Docker engine
+        shell: pwsh
+        run: |
+          $svc = Get-Service docker -ErrorAction SilentlyContinue
+          if (-not $svc) { Write-Error 'The Docker engine service is not installed on this runner'; exit 1 }
+          if ($svc.Status -ne 'Running') { Start-Service docker }
+          foreach ($i in 1..30) {
+            docker version --format '{{.Server.Os}} {{.Server.Version}}' 2>$null
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds 2
+          }
+          Write-Error 'The Docker engine did not start'; exit 1
+
       - name: Build image
         shell: pwsh
         run: |
