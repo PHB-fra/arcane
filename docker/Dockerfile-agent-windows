@@ -3,8 +3,8 @@
 ARG BASE_IMAGE=mcr.microsoft.com/windows/nanoserver:ltsc2022
 FROM ${BASE_IMAGE}
 
-WORKDIR C:\\app
-COPY arcane-agent.exe C:\\app\\arcane-agent.exe
+WORKDIR C:/app
+COPY arcane-agent.exe C:/app/arcane-agent.exe
 
 ENV ENVIRONMENT=production \
     AGENT_MODE=true \
@@ -15,7 +15,7 @@ ENV ENVIRONMENT=production \
 # ContainerUser cannot open the Docker engine named pipe mounted into the container.
 USER ContainerAdministrator
 EXPOSE 3553
-VOLUME ["C:\\app\\data"]
+VOLUME ["C:/app/data"]
 
 LABEL com.getarcaneapp.arcane.agent="true"
 
