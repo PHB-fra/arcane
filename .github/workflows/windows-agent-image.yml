@@ -160,6 +160,14 @@ jobs:
             "| ``ltsc2022-preview`` | ``${{ steps.push2022.outputs.digest }}`` |"
           ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
 
+      # The attestation action pushes to GHCR with the Docker credentials.
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Image attestation (ltsc2019)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
