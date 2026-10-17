@@ -68,7 +68,8 @@ jobs:
           }
           foreach ($release in $bases.Keys) {
             .\out\windows-image.exe build -base $bases[$release] -exe out\arcane-agent.exe `
-              -tag "${env:IMAGE}:${env:VERSION}-${release}-preview" -out "out\${release}.tar" @labels
+              -tag "${env:IMAGE}:${env:VERSION}-${release}-preview" -out "out\${release}.tar" `
+              -load-out "out\${release}-load.tar" @labels
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -89,7 +90,7 @@ jobs:
       - name: Smoke test (ltsc2022)
         shell: pwsh
         run: |
-          docker load -i out\ltsc2022.tar
+          docker load -i out\ltsc2022-load.tar
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           docker run -d --name smoke --isolation process `
             -e AGENT_TOKEN=arc_smoketest -e MANAGER_API_URL=http://127.0.0.1:9 `
