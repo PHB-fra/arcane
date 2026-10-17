@@ -1,0 +1,22 @@
+# Unofficial preview: Arcane agent as a Windows container (Windows Server 2022).
+# Build context: a directory containing arcane-agent.exe built for windows/amd64.
+ARG BASE_IMAGE=mcr.microsoft.com/windows/nanoserver:ltsc2022
+FROM ${BASE_IMAGE}
+
+WORKDIR C:\\app
+COPY arcane-agent.exe C:\\app\\arcane-agent.exe
+
+ENV ENVIRONMENT=production \
+    AGENT_MODE=true \
+    GIN_MODE=release \
+    PORT=3553 \
+    DOCKER_HOST=npipe:////./pipe/docker_engine
+
+# ContainerUser cannot open the Docker engine named pipe mounted into the container.
+USER ContainerAdministrator
+EXPOSE 3553
+VOLUME ["C:\\app\\data"]
+
+LABEL com.getarcaneapp.arcane.agent="true"
+
+CMD ["C:\\app\\arcane-agent.exe"]
