@@ -33,6 +33,8 @@ runs Windows Server 2019, so that image is not started in CI.
 
 - Windows Server 2019, 2022 or 2025 with Docker Engine in Windows containers mode (process isolation).
   On Windows 11, use the `ltsc2022-preview` tag with `--isolation hyperv`.
+- A named volume on `C:\app\data` (`-v arcane-agent-data:C:\app\data`). The image declares no
+  volume, so without it the agent data is lost when the container is recreated.
 
 ## Run
 
@@ -69,6 +71,10 @@ gh attestation verify oci://ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview --
 
 ## Known limitations
 
-- Self-upgrade, system backup/restore and container self-detection assume a Linux
-  container and are not expected to work.
+- Self-upgrade (manual or auto-update) is tested end to end in CI on Windows Server 2022 and
+  2025. On Windows Server 2019 it is still under test: it froze a host during earlier
+  attempts. If in doubt, exclude the agent container from auto-update on the manager and
+  update with `docker/examples/deploy-arcane-agent-windows.ps1`.
+- System backup/restore and container self-detection assume a Linux container and are not
+  expected to work.
 - HTTPS to the manager relies on the nanoserver root certificate store.

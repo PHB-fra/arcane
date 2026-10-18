@@ -99,7 +99,9 @@ func build(args []string) {
 	// ContainerUser cannot open the Docker engine named pipe mounted into the container.
 	cfg.User = "ContainerAdministrator"
 	cfg.ExposedPorts = map[string]struct{}{"3553/tcp": {}}
-	cfg.Volumes = map[string]struct{}{`C:\app\data`: {}}
+	// No VOLUME: Docker on Windows does not match it against a C:\app\data mount spelled
+	// with another case, adds an anonymous volume on the same path, and HCS refuses to start.
+	cfg.Volumes = nil
 	if cfg.Labels == nil {
 		cfg.Labels = map[string]string{}
 	}
