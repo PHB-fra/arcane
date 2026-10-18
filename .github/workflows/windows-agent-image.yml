@@ -20,6 +20,9 @@ env:
   ACFS_VERSION: 0.6.1
   BUSYBOX_FILE: busybox-w64-FRP-6075-g169694ebd.exe
   BUSYBOX_SHA256: 07bb1e5b095b00d68a695481f9240879f33c5724b40aa2308f999d54ed78f075
+  # Same Trivy as ghcr.io/getarcaneapp/tools; the checksum is from its release checksums file.
+  TRIVY_VERSION: 0.75.0
+  TRIVY_SHA256: 4e43bd71a30f51aee39525f60f2b47043af77eb8df8fe082aae4372b69c6660f
 
 jobs:
   build:
@@ -122,8 +125,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
-      # Windows counterpart of the tools image used by the volume helper containers:
-      # the same BusyBox applets as ghcr.io/getarcaneapp/tools, and acfs.
+      # Windows counterpart of the tools image used by the volume helper and scan
+      # containers: the same BusyBox applets as ghcr.io/getarcaneapp/tools, acfs and Trivy.
       - name: Build tools images
         shell: pwsh
         run: |
@@ -141,9 +144,15 @@ jobs:
           $actual = (Get-FileHash -Algorithm SHA256 out\busybox.exe).Hash
           if ($actual -ne $env:BUSYBOX_SHA256) { Write-Error "BusyBox checksum mismatch: got $actual"; exit 1 }
 
+          $trivyZip = "trivy_${env:TRIVY_VERSION}_windows-64bit.zip"
+          Invoke-WebRequest -UseBasicParsing -OutFile "out\$trivyZip" "https://github.com/aquasecurity/trivy/releases/download/v${env:TRIVY_VERSION}/$trivyZip"
+          $actual = (Get-FileHash -Algorithm SHA256 "out\$trivyZip").Hash
+          if ($actual -ne $env:TRIVY_SHA256) { Write-Error "Trivy checksum mismatch: got $actual"; exit 1 }
+          Expand-Archive -Path "out\$trivyZip" -DestinationPath out\trivy -Force
+
           # BusyBox picks the applet from its executable name, so each applet is a copy.
           $applets = 'sh', 'sleep', 'find', 'gzip', 'stat', 'readlink', 'head', 'rm', 'mkdir', 'mv', 'rmdir', 'mktemp', 'tar', 'test'
-          $files = @('-file', 'tools/bin/acfs.exe=out/acfs.exe', '-file', 'tools/bin/busybox.exe=out/busybox.exe')
+          $files = @('-file', 'tools/bin/acfs.exe=out/acfs.exe', '-file', 'tools/bin/busybox.exe=out/busybox.exe', '-file', 'tools/bin/trivy.exe=out/trivy/trivy.exe')
           foreach ($applet in $applets) { $files += '-file', "tools/bin/$applet.exe=out/busybox.exe" }
           $bases = @{
             'ltsc2019' = 'mcr.microsoft.com/windows/nanoserver:1809'
@@ -156,7 +165,7 @@ jobs:
               -load-out "out\$release\tools-load.tar" `
               -label "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY" `
               -label "org.opencontainers.image.revision=$env:GITHUB_SHA" `
-              -label 'org.opencontainers.image.description=BusyBox for Windows and acfs on nanoserver, for the volume helpers of unofficial Arcane Windows agents.'
+              -label 'org.opencontainers.image.description=BusyBox for Windows, acfs and Trivy on nanoserver, for the helper containers of unofficial Arcane Windows agents.'
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -384,6 +393,45 @@ jobs:
           if (docker volume ls -q --filter 'name=^browse-e2e$') { Write-Error 'The old volume was not removed'; exit 1 }
           docker rm -f browse-agent | Out-Null
           'Volume rename OK'
+
+      # Scans the agent's own image through the agent API, as the manager does.
+      - name: Vulnerability scan test
+        timeout-minutes: 20
+        shell: pwsh
+        run: |
+          $agent = "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview"
+          docker run --rm --isolation process "${env:TOOLS_IMAGE}:latest" trivy --version
+          if ($LASTEXITCODE -ne 0) { Write-Error 'trivy.exe does not start in the tools image'; exit 1 }
+          $imageId = docker image inspect -f '{{.Id}}' $agent
+
+          docker run -d --name scan-agent --isolation process `
+            -e AGENT_TOKEN=arc_scantest -e MANAGER_API_URL=http://127.0.0.1:9 `
+            -v \\.\pipe\docker_engine:\\.\pipe\docker_engine `
+            -v 'scan-agent-data:C:\app\data' `
+            $agent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ip = $null
+          foreach ($i in 1..30) {
+            $ip = docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' scan-agent
+            try { if ((Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://${ip}:3553/api/health").StatusCode -eq 200) { break } } catch { }
+            Start-Sleep -Seconds 2
+          }
+          $headers = @{ 'X-Arcane-Agent-Token' = 'arc_scantest' }
+          $api = "http://${ip}:3553/api/environments/0/images/$imageId/vulnerabilities"
+
+          Invoke-RestMethod -Method Post -ContentType 'application/json' -Body '{}' -Headers $headers "$api/scan" | ConvertTo-Json -Compress
+          $summary = $null
+          foreach ($i in 1..180) {
+            Start-Sleep -Seconds 5
+            $summary = (Invoke-RestMethod -Headers $headers "$api/summary").data
+            if ($summary.status -in 'completed', 'failed') { break }
+          }
+          $summary | ConvertTo-Json -Compress -Depth 4
+          if ($summary.status -ne 'completed') { Write-Error "Scan status '$($summary.status)': $($summary.error)"; exit 1 }
+          $found = (Invoke-RestMethod -Headers $headers $api).data
+          "Vulnerabilities found: $(@($found.vulnerabilities).Count)"
+          docker rm -f scan-agent | Out-Null
+          'Vulnerability scan OK'
 
       # Runs the agent like deploy-arcane-agent-windows.ps1 and triggers its self-upgrade
       # through the agent API, as the manager does. The registry tag holds the e2e

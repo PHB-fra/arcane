@@ -285,8 +285,8 @@ var profiles = map[string]profile{
 			cfg.Volumes = nil
 		},
 	},
-	// Windows counterpart of ghcr.io/getarcaneapp/tools: BusyBox applets and acfs in
-	// C:\tools\bin (no trivy yet). Arcane runs "sleep infinity" and execs commands by name.
+	// Windows counterpart of ghcr.io/getarcaneapp/tools: BusyBox applets, acfs and trivy
+	// in C:\tools\bin. Arcane runs "sleep infinity" and execs commands by name.
 	"tools": {
 		dirs: []string{"tools/", "tools/bin/", "tmp/", "root/", "root/.cache/"},
 		configure: func(cfg *v1.Config) {
