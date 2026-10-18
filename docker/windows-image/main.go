@@ -1,10 +1,10 @@
 // Command windows-image assembles the unofficial Windows images (the agent, and the
-// Rustic image its backups run) without a
+// Rustic and tools images its helper containers run) without a
 // Docker daemon, so one Windows runner can produce images for several Windows
 // Server releases (a Windows host can only build for its own release or older
 // ones under Hyper-V isolation).
 //
-//	windows-image build [-profile agent|rustic] -base mcr.microsoft.com/windows/nanoserver:1809 -exe arcane-agent.exe -tag ghcr.io/o/i:t -out i.tar [-load-out i-load.tar]
+//	windows-image build [-profile agent|rustic|tools] [-file layer/path=local/path ...] -base mcr.microsoft.com/windows/nanoserver:1809 -exe arcane-agent.exe -tag ghcr.io/o/i:t -out i.tar [-load-out i-load.tar]
 //	windows-image push -tar i.tar -tag ghcr.io/o/i:t [-tag ghcr.io/o/i:t2]
 //	windows-image index -tag ghcr.io/o/i:multi -from ghcr.io/o/i:a -from ghcr.io/o/i:b
 package main
@@ -57,8 +57,10 @@ func main() {
 func build(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	base := fs.String("base", "mcr.microsoft.com/windows/nanoserver:ltsc2022", "Windows base image")
-	profileName := fs.String("profile", "agent", "image to build: agent or rustic")
-	exe := fs.String("exe", "out/arcane-agent.exe", "windows/amd64 executable the image runs")
+	profileName := fs.String("profile", "agent", "image to build: agent, rustic or tools")
+	exe := fs.String("exe", "out/arcane-agent.exe", "windows/amd64 executable the image runs (agent and rustic)")
+	var extraFiles repeated
+	fs.Var(&extraFiles, "file", "extra layer/path=local/path file (repeatable)")
 	tag := fs.String("tag", "arcane-agent-windows:dev", "image name stored in the tarball")
 	out := fs.String("out", "image.tar", "output tarball, read back by push")
 	loadOut := fs.String("load-out", "", "optional legacy tarball for docker load on Windows")
@@ -75,7 +77,21 @@ func build(args []string) {
 		log.Fatalf("pull %s: %v", *base, err)
 	}
 
-	layerTar, err := layerTarball(*exe, prof)
+	var files [][2]string
+	if prof.file != "" {
+		files = append(files, [2]string{prof.file, *exe})
+	}
+	for _, f := range extraFiles {
+		layerPath, localPath, ok := strings.Cut(f, "=")
+		if !ok {
+			log.Fatalf("invalid -file %q", f)
+		}
+		files = append(files, [2]string{layerPath, localPath})
+	}
+	if len(files) == 0 {
+		log.Fatal("no file to add to the image")
+	}
+	layerTar, err := layerTarball(prof, files)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -227,7 +243,7 @@ func writeLegacy(path string, ref name.Reference, img v1.Image) error {
 // profile is what one kind of image adds on top of the nanoserver base.
 type profile struct {
 	dirs      []string // directories created in the layer, with a trailing slash
-	file      string   // layer path of the executable
+	file      string   // layer path of the -exe executable, empty when only -file is used
 	configure func(cfg *v1.Config)
 }
 
@@ -269,20 +285,24 @@ var profiles = map[string]profile{
 			cfg.Volumes = nil
 		},
 	},
+	// Windows counterpart of ghcr.io/getarcaneapp/tools: BusyBox applets and acfs in
+	// C:\tools\bin (no trivy yet). Arcane runs "sleep infinity" and execs commands by name.
+	"tools": {
+		dirs: []string{"tools/", "tools/bin/", "tmp/", "root/", "root/.cache/"},
+		configure: func(cfg *v1.Config) {
+			cfg.Env = append(cfg.Env, `PATH=C:\tools\bin;C:\Windows\system32;C:\Windows`)
+			cfg.WorkingDir = `C:\`
+			cfg.Entrypoint = nil
+			cfg.Cmd = []string{"sleep", "infinity"}
+			// Volume contents grant full access to administrators.
+			cfg.User = "ContainerAdministrator"
+			cfg.Volumes = nil
+		},
+	},
 }
 
-// layerTarball writes the profile's directories and executable to a temporary tar.
-func layerTarball(exe string, prof profile) (string, error) {
-	src, err := os.Open(exe)
-	if err != nil {
-		return "", err
-	}
-	defer src.Close()
-	st, err := src.Stat()
-	if err != nil {
-		return "", err
-	}
-
+// layerTarball writes the profile's directories and the files ([layer path, local path]) to a temporary tar.
+func layerTarball(prof profile, files [][2]string) (string, error) {
 	f, err := os.CreateTemp("", "arcane-layer-*.tar")
 	if err != nil {
 		return "", err
@@ -295,13 +315,29 @@ func layerTarball(exe string, prof profile) (string, error) {
 			return "", err
 		}
 	}
-	if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: prof.file, Mode: 0o755, Size: st.Size(), ModTime: now}); err != nil {
-		return "", err
-	}
-	if _, err := src.WriteTo(tw); err != nil {
-		return "", err
+	for _, file := range files {
+		if err := addFile(tw, file[0], file[1], now); err != nil {
+			return "", err
+		}
 	}
 	return f.Name(), tw.Close()
+}
+
+func addFile(tw *tar.Writer, layerPath, localPath string, modTime time.Time) error {
+	src, err := os.Open(localPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	st, err := src.Stat()
+	if err != nil {
+		return err
+	}
+	if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: layerPath, Mode: 0o755, Size: st.Size(), ModTime: modTime}); err != nil {
+		return err
+	}
+	_, err = src.WriteTo(tw)
+	return err
 }
 
 // setOutput exposes a value to later GitHub Actions steps when run in a workflow.
