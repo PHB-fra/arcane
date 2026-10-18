@@ -373,8 +373,17 @@ jobs:
           docker run --rm --isolation process -v 'browse-e2e:C:\volume' $agent `
             cmd /c 'if not exist C:\volume\newdir\ exit 1 & if exist C:\volume\old.txt exit 2 & if not exist C:\volume\sub\renamed.txt exit 3'
           if ($LASTEXITCODE -ne 0) { Write-Error "The volume does not hold the applied changes (check $LASTEXITCODE)"; exit 1 }
-          docker rm -f browse-agent | Out-Null
           'Volume file browser OK'
+
+          # Rename copies the data to a new volume, then removes the old one.
+          $rename = "http://${ip}:3553/api/environments/0/volumes/browse-e2e/rename"
+          Invoke-RestMethod -Method Post -ContentType 'application/json' -Body '{"name":"browse-renamed"}' -Headers $headers $rename | ConvertTo-Json -Compress
+          docker run --rm --isolation process -v 'browse-renamed:C:\volume' $agent `
+            cmd /c 'if not exist C:\volume\newdir\ exit 1 & if not exist C:\volume\sub\renamed.txt exit 2'
+          if ($LASTEXITCODE -ne 0) { Write-Error "The renamed volume misses data (check $LASTEXITCODE)"; exit 1 }
+          if (docker volume ls -q --filter 'name=^browse-e2e$') { Write-Error 'The old volume was not removed'; exit 1 }
+          docker rm -f browse-agent | Out-Null
+          'Volume rename OK'
 
       # Runs the agent like deploy-arcane-agent-windows.ps1 and triggers its self-upgrade
       # through the agent API, as the manager does. The registry tag holds the e2e
