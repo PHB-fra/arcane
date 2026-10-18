@@ -13,6 +13,7 @@ import (
 	versiontypes "github.com/getarcaneapp/arcane/types/v2/version"
 	"github.com/libtnb/sqlite"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -723,4 +724,30 @@ func TestResumeUpdateAllFinalizesManagerWithoutRerunningAgents(t *testing.T) {
 	// Remote rows are untouched — proving the agents phase was NOT re-run on resume.
 	require.Equal(t, EnvironmentUpdateResultStatusUpdated, got.Results[1].Status)
 	require.Equal(t, EnvironmentUpdateResultStatusSkippedOffline, got.Results[2].Status)
+}
+
+func TestUpgradeLogMountWindowsContainer(t *testing.T) {
+	current := container.InspectResponse{
+		Platform: "windows",
+		Mounts: []container.MountPoint{
+			{Type: mount.TypeNamedPipe, Source: `\\.\pipe\docker_engine`, Destination: `\\.\pipe\docker_engine`},
+			{Type: mount.TypeVolume, Name: "arcane-agent-data", Destination: `c:\app\data`},
+		},
+	}
+	got := upgradeLogMount(current)
+	require.NotNil(t, got)
+	require.Equal(t, mount.TypeVolume, got.Type)
+	require.Equal(t, "arcane-agent-data", got.Source)
+	require.Equal(t, `C:\app\data`, got.Target)
+}
+
+func TestUpgradeLogMountLinuxContainer(t *testing.T) {
+	current := container.InspectResponse{
+		Platform: "linux",
+		Mounts:   []container.MountPoint{{Type: mount.TypeVolume, Name: "arcane-data", Destination: "/app/data"}},
+	}
+	got := upgradeLogMount(current)
+	require.NotNil(t, got)
+	require.Equal(t, "arcane-data", got.Source)
+	require.Equal(t, "/app/data", got.Target)
 }
