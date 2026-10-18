@@ -216,7 +216,9 @@ jobs:
           }
 
           # Keep the upgrader after it exits so its result and logs can be checked.
+          # Direct mode publishes the agent port, which the recreated container takes over.
           docker run -d --name arcane-agent --restart unless-stopped --isolation process `
+            -p 3553:3553 `
             -e AGENT_TOKEN=arc_e2etest -e MANAGER_API_URL=http://127.0.0.1:9 `
             -e ARCANE_UPGRADE_KEEP_CONTAINER=true `
             -v \\.\pipe\docker_engine:\\.\pipe\docker_engine `
@@ -250,6 +252,8 @@ jobs:
           if (-not (Wait-Health arcane-agent)) { Write-Error 'The recreated agent did not answer /api/health'; exit 1 }
           $variant = docker inspect -f '{{index .Config.Labels "com.getarcaneapp.e2e.variant"}}' arcane-agent
           if ($variant -ne 'upgraded') { Write-Error 'The recreated agent does not run the e2e variant'; exit 1 }
+          $ports = docker inspect -f '{{json .HostConfig.PortBindings}}' arcane-agent
+          if ($ports -notmatch '"3553/tcp":\[\{"HostIp":"[^"]*","HostPort":"3553"\}\]') { Write-Error "Unexpected port bindings after the upgrade: $ports"; exit 1 }
           $volumes = docker inspect -f '{{range .Mounts}}{{.Type}}={{.Name}}{{println}}{{end}}' arcane-agent | Where-Object { $_ -like 'volume=*' }
           if (@($volumes).Count -ne 1 -or $volumes -ne 'volume=e2e-data') { Write-Error "Unexpected volumes after the upgrade: $volumes"; exit 1 }
           if (docker ps -a --filter 'name=arcane-agent-old' --format '{{.Names}}') { Write-Error 'The old agent container was left behind'; exit 1 }
