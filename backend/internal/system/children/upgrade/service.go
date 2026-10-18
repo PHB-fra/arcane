@@ -496,6 +496,9 @@ func (s *Service) runPreparedUpgrade(ctx context.Context, prepared *preparedUpgr
 				NetworkMode: networkMode,
 				SecurityOpt: securityOpt,
 				Privileged:  kit.FromPtr(prepared.current.HostConfig).Privileged,
+				// Windows only mounts the engine named pipe under process isolation, which the
+				// daemon default (hyperv on some hosts) would not give the upgrader.
+				Isolation: kit.FromPtr(prepared.current.HostConfig).Isolation,
 			},
 			NetworkingConfig: func() *network.NetworkingConfig {
 				if networkMode == "" || !networkMode.IsUserDefined() {
