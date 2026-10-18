@@ -14,6 +14,12 @@ env:
   # Must match rustic.WindowsImage in backend/pkg/libarcane/rustic/image.go.
   RUSTIC_IMAGE: ghcr.io/phb-fra/rustic-windows
   RUSTIC_VERSION: 0.11.2
+  # Must match volumehelper.WindowsToolsImage in backend/pkg/libarcane/volumehelper/helper.go.
+  TOOLS_IMAGE: ghcr.io/phb-fra/arcane-tools-windows
+  # Same acfs as ghcr.io/getarcaneapp/tools, and a pinned BusyBox for Windows (frippery.org).
+  ACFS_VERSION: 0.6.1
+  BUSYBOX_FILE: busybox-w64-FRP-6075-g169694ebd.exe
+  BUSYBOX_SHA256: 07bb1e5b095b00d68a695481f9240879f33c5724b40aa2308f999d54ed78f075
 
 jobs:
   build:
@@ -113,6 +119,44 @@ jobs:
               -label "org.opencontainers.image.revision=$env:GITHUB_SHA" `
               -label "org.opencontainers.image.version=$env:RUSTIC_VERSION" `
               -label 'org.opencontainers.image.description=Official Rustic Windows release binary on nanoserver, for unofficial Arcane Windows agents.'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      # Windows counterpart of the tools image used by the volume helper containers:
+      # the same BusyBox applets as ghcr.io/getarcaneapp/tools, and acfs.
+      - name: Build tools images
+        shell: pwsh
+        run: |
+          git clone -q --depth 1 --branch "acfs/v${env:ACFS_VERSION}" https://github.com/getarcaneapp/kit.git out\kit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:GOWORK = 'off'
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go build -C out\kit\acfs -trimpath -buildvcs=false `
+            -ldflags "-s -w -X go.getarcane.app/acfs/internal/version.Version=v${env:ACFS_VERSION}" -o ..\..\acfs.exe ./cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Invoke-WebRequest -UseBasicParsing -OutFile out\busybox.exe "https://frippery.org/files/busybox/${env:BUSYBOX_FILE}"
+          $actual = (Get-FileHash -Algorithm SHA256 out\busybox.exe).Hash
+          if ($actual -ne $env:BUSYBOX_SHA256) { Write-Error "BusyBox checksum mismatch: got $actual"; exit 1 }
+
+          # BusyBox picks the applet from its executable name, so each applet is a copy.
+          $applets = 'sh', 'sleep', 'find', 'gzip', 'stat', 'readlink', 'head', 'rm', 'mkdir', 'mv', 'rmdir', 'mktemp', 'tar', 'test'
+          $files = @('-file', 'tools/bin/acfs.exe=out/acfs.exe', '-file', 'tools/bin/busybox.exe=out/busybox.exe')
+          foreach ($applet in $applets) { $files += '-file', "tools/bin/$applet.exe=out/busybox.exe" }
+          $bases = @{
+            'ltsc2019' = 'mcr.microsoft.com/windows/nanoserver:1809'
+            'ltsc2022' = 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+            'ltsc2025' = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
+          }
+          foreach ($release in $bases.Keys) {
+            .\out\windows-image.exe build -profile tools -base $bases[$release] @files `
+              -tag "${env:TOOLS_IMAGE}:${release}" -out "out\$release\tools.tar" `
+              -load-out "out\$release\tools-load.tar" `
+              -label "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY" `
+              -label "org.opencontainers.image.revision=$env:GITHUB_SHA" `
+              -label 'org.opencontainers.image.description=BusyBox for Windows and acfs on nanoserver, for the volume helpers of unofficial Arcane Windows agents.'
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -274,6 +318,64 @@ jobs:
           docker rm -f backup-agent | Out-Null
           'Volume backup OK'
 
+      # Browses and edits a volume through the agent API, as the volume file browser
+      # does. The tools image under test is tagged locally, so the agent does not pull it.
+      - name: Volume file browser test
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $tools = "${env:TOOLS_IMAGE}:latest"
+          docker load -i out\tools-load.tar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker tag "${env:TOOLS_IMAGE}:${{ matrix.release }}" $tools
+          docker run --rm --isolation process $tools sh -c 'echo "sh: ok"; acfs --version'
+          if ($LASTEXITCODE -ne 0) { Write-Error 'The tools image cannot run sh or acfs'; exit 1 }
+
+          $agent = "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview"
+          docker volume create browse-e2e | Out-Null
+          docker run --rm --isolation process -v 'browse-e2e:C:\volume' $agent `
+            cmd /c 'mkdir C:\volume\sub && echo hello> C:\volume\sub\hello.txt && echo old> C:\volume\old.txt'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          docker run -d --name browse-agent --isolation process `
+            -e AGENT_TOKEN=arc_browsetest -e MANAGER_API_URL=http://127.0.0.1:9 `
+            -v \\.\pipe\docker_engine:\\.\pipe\docker_engine `
+            -v 'browse-agent-data:C:\app\data' `
+            $agent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ip = $null
+          foreach ($i in 1..30) {
+            $ip = docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' browse-agent
+            try { if ((Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://${ip}:3553/api/health").StatusCode -eq 200) { break } } catch { }
+            Start-Sleep -Seconds 2
+          }
+          $headers = @{ 'X-Arcane-Agent-Token' = 'arc_browsetest' }
+          $api = "http://${ip}:3553/api/environments/0/volumes/browse-e2e/workspace"
+
+          $workspace = (Invoke-RestMethod -Headers $headers $api).data
+          $paths = @($workspace.files | ForEach-Object relativePath)
+          "Files: $($paths -join ', ')"
+          if ($paths -notcontains 'sub/hello.txt') { Write-Error 'sub/hello.txt is missing from the listing'; exit 1 }
+
+          $file = (Invoke-RestMethod -Headers $headers "$api/file?relativePath=sub/hello.txt").data
+          if ("$($file.content)".Trim() -ne 'hello') { Write-Error "Read content: '$($file.content)'"; exit 1 }
+
+          $manifest = @{
+            fileTreeRevision = $workspace.fileTreeRevision
+            fileChanges      = @(
+              @{ operation = 'create_folder'; relativePath = 'newdir' },
+              @{ operation = 'delete'; relativePath = 'old.txt' },
+              @{ operation = 'rename'; relativePath = 'sub/hello.txt'; newName = 'renamed.txt' }
+            )
+          } | ConvertTo-Json -Depth 4 -Compress
+          Invoke-RestMethod -Method Put -Headers $headers -Form @{ manifest = $manifest } $api | ConvertTo-Json -Compress -Depth 4
+
+          docker run --rm --isolation process -v 'browse-e2e:C:\volume' $agent `
+            cmd /c 'if not exist C:\volume\newdir\ exit 1 & if exist C:\volume\old.txt exit 2 & if not exist C:\volume\sub\renamed.txt exit 3'
+          if ($LASTEXITCODE -ne 0) { Write-Error "The volume does not hold the applied changes (check $LASTEXITCODE)"; exit 1 }
+          docker rm -f browse-agent | Out-Null
+          'Volume file browser OK'
+
       # Runs the agent like deploy-arcane-agent-windows.ps1 and triggers its self-upgrade
       # through the agent API, as the manager does. The registry tag holds the e2e
       # variant while the local tag holds the build under test, so the upgrade pulls a
@@ -419,9 +521,20 @@ jobs:
           .\out\windows-image.exe push -tar out\rustic.tar -tag "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${{ matrix.release }}"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Push tools image
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: push-tools
+        shell: pwsh
+        run: |
+          .\out\windows-image.exe push -tar out\tools.tar -tag "${env:TOOLS_IMAGE}:${{ matrix.release }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Summary
         shell: pwsh
         run: |
+          "| tools ``${{ matrix.release }}`` | ``${{ steps.push-tools.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
           "| ``${{ matrix.release }}-preview`` | ``${{ steps.push.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
           "| rustic ``v${env:RUSTIC_VERSION}-${{ matrix.release }}`` | ``${{ steps.push-rustic.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
 
@@ -438,6 +551,13 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image attestation (tools)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.TOOLS_IMAGE }}
+          subject-digest: ${{ steps.push-tools.outputs.digest }}
           push-to-registry: true
 
       - name: Image attestation (Rustic)
@@ -481,6 +601,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      # The tag Arcane pulls: each Windows host gets the tools image of its release.
+      - name: Push tools multi-release index
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: index-tools
+        shell: pwsh
+        run: |
+          $from = foreach ($release in 'ltsc2019', 'ltsc2022', 'ltsc2025') {
+            '-from', "${env:TOOLS_IMAGE}:${release}"
+          }
+          .\out\windows-image.exe index -tag "${env:TOOLS_IMAGE}:latest" @from
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       # The tag Arcane pulls: each Windows host gets the Rustic image of its release.
       - name: Push Rustic multi-release index
         env:
@@ -514,4 +648,11 @@ jobs:
         with:
           subject-name: ${{ env.RUSTIC_IMAGE }}
           subject-digest: ${{ steps.index-rustic.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image attestation (tools multi-release index)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.TOOLS_IMAGE }}
+          subject-digest: ${{ steps.index-tools.outputs.digest }}
           push-to-registry: true

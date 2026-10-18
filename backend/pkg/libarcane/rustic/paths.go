@@ -5,6 +5,8 @@ import (
 	"strings"
 
 	"github.com/moby/moby/api/types/mount"
+
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/volumehelper"
 )
 
 // windowsContainerPathsInternal moves the Linux paths Arcane uses inside the Rustic
@@ -17,13 +19,13 @@ func windowsContainerPathsInternal(command, env []string, mounts []mount.Mount) 
 	for i := range mounts {
 		if strings.HasPrefix(mounts[i].Target, "/") {
 			targets = append(targets, mounts[i].Target)
-			mounts[i].Target = windowsContainerPathInternal(mounts[i].Target)
+			mounts[i].Target = volumehelper.WindowsContainerPath(mounts[i].Target)
 		}
 	}
 	localize := func(value string) string {
 		for _, target := range targets {
 			if value == target || strings.HasPrefix(value, target+"/") {
-				return windowsContainerPathInternal(value)
+				return volumehelper.WindowsContainerPath(value)
 			}
 		}
 		return value
@@ -40,8 +42,4 @@ func windowsContainerPathsInternal(command, env []string, mounts []mount.Mount) 
 		}
 	}
 	return command, env, mounts
-}
-
-func windowsContainerPathInternal(linuxPath string) string {
-	return `C:` + strings.ReplaceAll(linuxPath, "/", `\`)
 }
