@@ -50,6 +50,17 @@ docker run -d --name arcane-agent --restart unless-stopped `
 Edge mode (the agent connects to the manager, no inbound port): replace `-p 3553:3553`
 with `-e EDGE_AGENT=true`.
 
+[`docker/examples/deploy-arcane-agent-windows.ps1`](docker/examples/deploy-arcane-agent-windows.ps1)
+does the same in one step: it checks that the engine runs Windows containers, pulls the image
+(or loads a tarball with `-Tarball` on hosts without access to ghcr.io), replaces any existing
+container and prints its first logs.
+
+```powershell
+$env:ARCANE_AGENT_TOKEN = 'arc_...'
+.\deploy-arcane-agent-windows.ps1 -ManagerUrl http://manager:3552        # direct mode
+.\deploy-arcane-agent-windows.ps1 -ManagerUrl https://manager.example -Edge
+```
+
 Verify the image provenance:
 
 ```powershell
