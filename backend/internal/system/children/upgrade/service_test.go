@@ -751,3 +751,8 @@ func TestUpgradeLogMountLinuxContainer(t *testing.T) {
 	require.Equal(t, "arcane-data", got.Source)
 	require.Equal(t, "/app/data", got.Target)
 }
+
+func TestWindowsBind(t *testing.T) {
+	require.Equal(t, `arcane-agent-data:C:\app\data`, windowsBind(mount.Mount{Type: mount.TypeVolume, Source: "arcane-agent-data", Target: `C:\app\data`}))
+	require.Equal(t, `D:\arcane:C:\app\data:ro`, windowsBind(mount.Mount{Type: mount.TypeBind, Source: `D:\arcane`, Target: `C:\app\data`, ReadOnly: true}))
+}

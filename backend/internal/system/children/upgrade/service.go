@@ -451,7 +451,13 @@ func (s *Service) runPreparedUpgrade(ctx context.Context, prepared *preparedUpgr
 	}
 
 	mounts := append([]mount.Mount{}, runtimeMounts...)
-	if appDataMount != nil {
+	var binds []string
+	switch {
+	case appDataMount == nil:
+	case isWindowsContainer(prepared.current):
+		// Windows Server 2019 fails to start a container given a volume through Mounts; -v binds work.
+		binds = append(binds, windowsBind(*appDataMount))
+	default:
 		mounts = append(mounts, *appDataMount)
 	}
 
@@ -492,6 +498,7 @@ func (s *Service) runPreparedUpgrade(ctx context.Context, prepared *preparedUpgr
 			},
 			HostConfig: &container.HostConfig{
 				AutoRemove:  !keepUpgraderContainer,
+				Binds:       binds,
 				Mounts:      mounts,
 				NetworkMode: networkMode,
 				SecurityOpt: securityOpt,
@@ -1410,4 +1417,9 @@ func upgradeLogMount(current container.InspectResponse) *mount.Mount {
 		}
 	}
 	return nil
+}
+
+// windowsBind writes a volume or bind mount in the -v short syntax (source:target[:ro]).
+func windowsBind(m mount.Mount) string {
+	return m.Source + ":" + m.Target + kit.Ternary(m.ReadOnly, ":ro", "")
 }
