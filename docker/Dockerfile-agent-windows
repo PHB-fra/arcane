@@ -16,7 +16,7 @@ ENV ENVIRONMENT=production \
 # ContainerUser cannot open the Docker engine named pipe mounted into the container.
 USER ContainerAdministrator
 EXPOSE 3553
-VOLUME ["C:/app/data"]
+# No VOLUME: mount a named volume on C:\app\data (see WINDOWS-AGENT-PREVIEW.md).
 
 LABEL com.getarcaneapp.arcane.agent="true"
 
