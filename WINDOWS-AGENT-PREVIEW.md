@@ -1,6 +1,6 @@
 # Arcane agent on Windows Server (unofficial preview)
 
-This branch builds the Arcane **agent** as a Windows container for Windows Server 2019 and 2022. It is **not an official
+This branch builds the Arcane **agent** as a Windows container for Windows Server 2019, 2022 and 2025. It is **not an official
 Arcane image** and is not supported by the Arcane maintainers. Feedback goes to
 [Discussion #4019](https://github.com/getarcaneapp/arcane/discussions/4019).
 
@@ -8,13 +8,14 @@ Images, built by [this workflow](.github/workflows/windows-agent-image.yml) from
 
 | Tag | Host |
 | --- | --- |
-| `ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview` | Windows Server 2019 or 2022: Docker picks the matching image |
+| `ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview` | Windows Server 2019, 2022 or 2025: Docker picks the matching image |
+| `ghcr.io/phb-fra/arcane-agent-windows:ltsc2025-preview` | Windows Server 2025 |
 | `ghcr.io/phb-fra/arcane-agent-windows:ltsc2022-preview` | Windows Server 2022 |
 | `ghcr.io/phb-fra/arcane-agent-windows:ltsc2019-preview` | Windows Server 2019 |
 
-Versioned tags (`2.16.1-ltsc-preview`, ...) are published as well. Both images contain the same
-`arcane-agent.exe`. CI only runs the Windows Server 2022 image; the 2019 image has not been
-started in CI.
+Versioned tags (`2.16.1-ltsc-preview`, ...) are published as well. All images contain the same
+`arcane-agent.exe`. CI starts the 2022 and 2025 images on matching runners; no GitHub runner
+runs Windows Server 2019, so that image is not started in CI.
 
 ## Changes compared with upstream `main`
 
@@ -24,14 +25,14 @@ started in CI.
   [PHB-fra/copacetic@arcane-windows-v0.15.0](https://github.com/PHB-fra/copacetic/tree/arcane-windows-v0.15.0)
   (v0.15.0 plus the fix proposed in project-copacetic/copacetic#1735), until a copacetic
   release includes it.
-- `docker/windows-image`: assembles the nanoserver 1809 (2019) and ltsc2022 images without a Docker
-  daemon, so a single Windows Server 2022 runner builds both.
+- `docker/windows-image`: assembles the nanoserver 1809 (2019), ltsc2022 and ltsc2025 images without
+  a Docker daemon, so a single Windows Server 2022 runner builds all three.
 - `docker/Dockerfile-agent-windows`: equivalent Dockerfile, to build on a Windows host.
 
 ## Requirements
 
-- Windows Server 2019 or 2022 with Docker Engine in Windows containers mode (process isolation).
-  On Windows 11 or Windows Server 2025, use the `ltsc2022-preview` tag with `--isolation hyperv`.
+- Windows Server 2019, 2022 or 2025 with Docker Engine in Windows containers mode (process isolation).
+  On Windows 11, use the `ltsc2022-preview` tag with `--isolation hyperv`.
 
 ## Run
 

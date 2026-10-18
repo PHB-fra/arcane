@@ -16,9 +16,8 @@ jobs:
     runs-on: windows-2022
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
+    outputs:
+      version: ${{ steps.exe.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -32,6 +31,7 @@ jobs:
             docker/windows-image/go.sum
 
       - name: Build arcane-agent.exe
+        id: exe
         shell: pwsh
         run: |
           $meta = Get-Content .arcane.json -Raw | ConvertFrom-Json
@@ -47,9 +47,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
           "VERSION=$($meta.version)" >> $env:GITHUB_ENV
+          "version=$($meta.version)" >> $env:GITHUB_OUTPUT
 
-      # The images are assembled without a Docker daemon: a Windows Server 2022 runner
-      # cannot build a Windows Server 2019 image with process isolation.
+      # The images are assembled without a Docker daemon: a Windows runner can only
+      # build images for its own release with process isolation.
       - name: Build images
         shell: pwsh
         run: |
@@ -65,13 +66,70 @@ jobs:
           $bases = @{
             'ltsc2019' = 'mcr.microsoft.com/windows/nanoserver:1809'
             'ltsc2022' = 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+            'ltsc2025' = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
           }
           foreach ($release in $bases.Keys) {
+            New-Item -ItemType Directory -Force "out\$release" | Out-Null
             .\out\windows-image.exe build -base $bases[$release] -exe out\arcane-agent.exe `
-              -tag "${env:IMAGE}:${env:VERSION}-${release}-preview" -out "out\${release}.tar" `
-              -load-out "out\${release}-load.tar" @labels
+              -tag "${env:IMAGE}:${env:VERSION}-${release}-preview" -out "out\$release\image.tar" `
+              -load-out "out\$release\load.tar" @labels
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: arcane-agent-windows-amd64
+          path: |
+            out/arcane-agent.exe
+            out/windows-image.exe
+
+      - name: Upload ltsc2019 image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-ltsc2019
+          path: out/ltsc2019/
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload ltsc2022 image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-ltsc2022
+          path: out/ltsc2022/
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload ltsc2025 image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-ltsc2025
+          path: out/ltsc2025/
+          retention-days: 1
+          compression-level: 0
+
+  # Process isolation only runs an image on the matching Windows release, so each
+  # image is started on its own runner. No GitHub runner runs Windows Server 2019.
+  smoke:
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - release: ltsc2022
+            runner: windows-2022
+          - release: ltsc2025
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-${{ matrix.release }}
+          path: out
 
       - name: Start Docker engine
         shell: pwsh
@@ -86,16 +144,15 @@ jobs:
           }
           Write-Error 'The Docker engine did not start'; exit 1
 
-      # Only the Windows Server 2022 image can run on this runner (process isolation).
-      - name: Smoke test (ltsc2022)
+      - name: Smoke test
         shell: pwsh
         run: |
-          docker load -i out\ltsc2022-load.tar
+          docker load -i out\load.tar
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           docker run -d --name smoke --isolation process `
             -e AGENT_TOKEN=arc_smoketest -e MANAGER_API_URL=http://127.0.0.1:9 `
             -v \\.\pipe\docker_engine:\\.\pipe\docker_engine `
-            "${env:IMAGE}:${env:VERSION}-ltsc2022-preview"
+            "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $ip = docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' smoke
           $ok = $false
@@ -111,54 +168,47 @@ jobs:
           docker rm -f smoke | Out-Null
           if (-not $ok) { Write-Error 'The agent did not answer /api/health'; exit 1 }
 
-      - name: Upload arcane-agent.exe
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+  publish:
+    needs: [build, smoke]
+    strategy:
+      matrix:
+        release: [ltsc2019, ltsc2022, ltsc2025]
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: arcane-agent-windows-amd64
-          path: out/arcane-agent.exe
+          path: out
 
-      - name: Push ltsc2019 image
+      - name: Download image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-${{ matrix.release }}
+          path: out
+
+      - name: Push image
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        id: push2019
+        id: push
         shell: pwsh
         run: |
-          .\out\windows-image.exe push -tar out\ltsc2019.tar `
-            -tag "${env:IMAGE}:${env:VERSION}-ltsc2019-preview" -tag "${env:IMAGE}:ltsc2019-preview"
+          .\out\windows-image.exe push -tar out\image.tar `
+            -tag "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview" -tag "${env:IMAGE}:${{ matrix.release }}-preview"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Push ltsc2022 image
-        env:
-          REGISTRY_USERNAME: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        id: push2022
+      - name: Summary
         shell: pwsh
         run: |
-          .\out\windows-image.exe push -tar out\ltsc2022.tar `
-            -tag "${env:IMAGE}:${env:VERSION}-ltsc2022-preview" -tag "${env:IMAGE}:ltsc2022-preview"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      # Windows hosts pull the entry matching their own release from these tags.
-      - name: Push multi-release index
-        env:
-          REGISTRY_USERNAME: ${{ github.actor }}
-          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        id: index
-        shell: pwsh
-        run: |
-          .\out\windows-image.exe index -tag "${env:IMAGE}:${env:VERSION}-ltsc-preview" `
-            -from "${env:IMAGE}:${env:VERSION}-ltsc2019-preview" -from "${env:IMAGE}:${env:VERSION}-ltsc2022-preview"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .\out\windows-image.exe index -tag "${env:IMAGE}:ltsc-preview" `
-            -from "${env:IMAGE}:${env:VERSION}-ltsc2019-preview" -from "${env:IMAGE}:${env:VERSION}-ltsc2022-preview"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          @(
-            "| Tag | Digest |"
-            "| --- | --- |"
-            "| ``ltsc2019-preview`` | ``${{ steps.push2019.outputs.digest }}`` |"
-            "| ``ltsc2022-preview`` | ``${{ steps.push2022.outputs.digest }}`` |"
-          ) -join "`n" >> $env:GITHUB_STEP_SUMMARY
+          "| ``${{ matrix.release }}-preview`` | ``${{ steps.push.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
 
       # The attestation action pushes to GHCR with the Docker credentials.
       - name: Login to GHCR
@@ -168,19 +218,52 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image attestation (ltsc2019)
+      - name: Image attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.push2019.outputs.digest }}
+          subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
-      - name: Image attestation (ltsc2022)
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+  # Windows hosts pull the entry matching their own release from these tags.
+  index:
+    needs: [build, publish]
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.push2022.outputs.digest }}
-          push-to-registry: true
+          name: arcane-agent-windows-amd64
+          path: out
+
+      - name: Push multi-release index
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: index
+        shell: pwsh
+        run: |
+          $from = foreach ($release in 'ltsc2019', 'ltsc2022', 'ltsc2025') {
+            '-from', "${env:IMAGE}:${env:VERSION}-${release}-preview"
+          }
+          foreach ($tag in "${env:VERSION}-ltsc-preview", 'ltsc-preview') {
+            .\out\windows-image.exe index -tag "${env:IMAGE}:$tag" @from
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Image attestation (multi-release index)
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
