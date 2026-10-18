@@ -328,7 +328,7 @@ jobs:
           docker load -i out\tools-load.tar
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           docker tag "${env:TOOLS_IMAGE}:${{ matrix.release }}" $tools
-          docker run --rm --isolation process $tools sh -c 'echo "sh: ok"; acfs --version'
+          docker run --rm --isolation process $tools sh -c 'echo "sh: ok"; acfs version'
           if ($LASTEXITCODE -ne 0) { Write-Error 'The tools image cannot run sh or acfs'; exit 1 }
 
           $agent = "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview"
