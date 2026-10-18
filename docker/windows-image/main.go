@@ -1,9 +1,10 @@
-// Command windows-image assembles the unofficial Windows agent images without a
+// Command windows-image assembles the unofficial Windows images (the agent, and the
+// Rustic image its backups run) without a
 // Docker daemon, so one Windows runner can produce images for several Windows
 // Server releases (a Windows host can only build for its own release or older
 // ones under Hyper-V isolation).
 //
-//	windows-image build -base mcr.microsoft.com/windows/nanoserver:1809 -exe arcane-agent.exe -tag ghcr.io/o/i:t -out i.tar [-load-out i-load.tar]
+//	windows-image build [-profile agent|rustic] -base mcr.microsoft.com/windows/nanoserver:1809 -exe arcane-agent.exe -tag ghcr.io/o/i:t -out i.tar [-load-out i-load.tar]
 //	windows-image push -tar i.tar -tag ghcr.io/o/i:t [-tag ghcr.io/o/i:t2]
 //	windows-image index -tag ghcr.io/o/i:multi -from ghcr.io/o/i:a -from ghcr.io/o/i:b
 package main
@@ -56,20 +57,25 @@ func main() {
 func build(args []string) {
 	fs := flag.NewFlagSet("build", flag.ExitOnError)
 	base := fs.String("base", "mcr.microsoft.com/windows/nanoserver:ltsc2022", "Windows base image")
-	exe := fs.String("exe", "out/arcane-agent.exe", "agent built for windows/amd64")
+	profileName := fs.String("profile", "agent", "image to build: agent or rustic")
+	exe := fs.String("exe", "out/arcane-agent.exe", "windows/amd64 executable the image runs")
 	tag := fs.String("tag", "arcane-agent-windows:dev", "image name stored in the tarball")
 	out := fs.String("out", "image.tar", "output tarball, read back by push")
 	loadOut := fs.String("load-out", "", "optional legacy tarball for docker load on Windows")
 	var labels repeated
 	fs.Var(&labels, "label", "extra key=value label (repeatable)")
 	_ = fs.Parse(args)
+	prof, ok := profiles[*profileName]
+	if !ok {
+		log.Fatalf("unknown profile %q", *profileName)
+	}
 
 	img, err := crane.Pull(*base, crane.WithPlatform(windowsAMD64))
 	if err != nil {
 		log.Fatalf("pull %s: %v", *base, err)
 	}
 
-	layerTar, err := layerTarball(*exe)
+	layerTar, err := layerTarball(*exe, prof)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -86,26 +92,10 @@ func build(args []string) {
 		log.Fatal(err)
 	}
 	cfg := cfgFile.Config.DeepCopy()
-	cfg.Env = append(cfg.Env,
-		"ENVIRONMENT=production",
-		"AGENT_MODE=true",
-		"GIN_MODE=release",
-		"PORT=3553",
-		"DOCKER_HOST=npipe:////./pipe/docker_engine",
-	)
-	cfg.WorkingDir = `C:\app`
-	cfg.Entrypoint = nil
-	cfg.Cmd = []string{`C:\app\arcane-agent.exe`}
-	// ContainerUser cannot open the Docker engine named pipe mounted into the container.
-	cfg.User = "ContainerAdministrator"
-	cfg.ExposedPorts = map[string]struct{}{"3553/tcp": {}}
-	// No VOLUME: Docker on Windows does not match it against a C:\app\data mount spelled
-	// with another case, adds an anonymous volume on the same path, and HCS refuses to start.
-	cfg.Volumes = nil
 	if cfg.Labels == nil {
 		cfg.Labels = map[string]string{}
 	}
-	cfg.Labels["com.getarcaneapp.arcane.agent"] = "true"
+	prof.configure(cfg)
 	cfg.Labels["org.opencontainers.image.base.name"] = *base
 	for _, l := range labels {
 		k, v, ok := strings.Cut(l, "=")
@@ -234,8 +224,55 @@ func writeLegacy(path string, ref name.Reference, img v1.Image) error {
 	return f.Close()
 }
 
-// layerTarball writes app/arcane-agent.exe and an empty app/data/ to a temporary tar.
-func layerTarball(exe string) (string, error) {
+// profile is what one kind of image adds on top of the nanoserver base.
+type profile struct {
+	dirs      []string // directories created in the layer, with a trailing slash
+	file      string   // layer path of the executable
+	configure func(cfg *v1.Config)
+}
+
+var profiles = map[string]profile{
+	"agent": {
+		dirs: []string{"app/", "app/data/"},
+		file: "app/arcane-agent.exe",
+		configure: func(cfg *v1.Config) {
+			cfg.Env = append(cfg.Env,
+				"ENVIRONMENT=production",
+				"AGENT_MODE=true",
+				"GIN_MODE=release",
+				"PORT=3553",
+				"DOCKER_HOST=npipe:////./pipe/docker_engine",
+			)
+			cfg.WorkingDir = `C:\app`
+			cfg.Entrypoint = nil
+			cfg.Cmd = []string{`C:\app\arcane-agent.exe`}
+			// ContainerUser cannot open the Docker engine named pipe mounted into the container.
+			cfg.User = "ContainerAdministrator"
+			cfg.ExposedPorts = map[string]struct{}{"3553/tcp": {}}
+			// No VOLUME: Docker on Windows does not match it against a C:\app\data mount spelled
+			// with another case, adds an anonymous volume on the same path, and HCS refuses to start.
+			cfg.Volumes = nil
+			cfg.Labels["com.getarcaneapp.arcane.agent"] = "true"
+		},
+	},
+	// Same contract as ghcr.io/rustic-rs/rustic: the entrypoint is rustic and Arcane
+	// passes its arguments as the command.
+	"rustic": {
+		dirs: []string{"rustic/"},
+		file: "rustic/rustic.exe",
+		configure: func(cfg *v1.Config) {
+			cfg.WorkingDir = `C:\rustic`
+			cfg.Entrypoint = []string{`C:\rustic\rustic.exe`}
+			cfg.Cmd = nil
+			// Backed up volumes and the repository volume grant full access to administrators.
+			cfg.User = "ContainerAdministrator"
+			cfg.Volumes = nil
+		},
+	},
+}
+
+// layerTarball writes the profile's directories and executable to a temporary tar.
+func layerTarball(exe string, prof profile) (string, error) {
 	src, err := os.Open(exe)
 	if err != nil {
 		return "", err
@@ -253,12 +290,12 @@ func layerTarball(exe string) (string, error) {
 	defer f.Close()
 	tw := tar.NewWriter(f)
 	now := time.Now()
-	for _, dir := range []string{"app/", "app/data/"} {
+	for _, dir := range prof.dirs {
 		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: dir, Mode: 0o755, ModTime: now}); err != nil {
 			return "", err
 		}
 	}
-	if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: "app/arcane-agent.exe", Mode: 0o755, Size: st.Size(), ModTime: now}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: prof.file, Mode: 0o755, Size: st.Size(), ModTime: now}); err != nil {
 		return "", err
 	}
 	if _, err := src.WriteTo(tw); err != nil {

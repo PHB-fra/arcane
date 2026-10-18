@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"strings"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 )
 
 // Run executes one Rustic command in an ephemeral container built from
-// DefaultImage and returns its trimmed stdout. It is the single Rustic
+// Image() and returns its trimmed stdout. It is the single Rustic
 // invocation contract, shared by the backup engine and the detached recovery
 // helper; the image must already be present. The standard RUSTIC_* variables
 // are appended to environment, and networkMode is applied verbatim ("" keeps
@@ -46,12 +47,16 @@ func Run(ctx context.Context, dockerClient *client.Client, password string, comm
 		defer removeTrustBundle(ctx, dockerClient, trustVolume)
 		allMounts = append(allMounts, mount.Mount{Type: mount.TypeVolume, Source: trustVolume, Target: trustBundleDir, ReadOnly: true})
 	}
-	hostConfig := volumehelper.HostConfig(DefaultImage, nil, allMounts)
+	if runtime.GOOS == "windows" {
+		command, env, allMounts = windowsContainerPathsInternal(command, env, allMounts)
+	}
+	image := Image()
+	hostConfig := volumehelper.HostConfig(image, nil, allMounts)
 	hostConfig.AutoRemove = false
 	hostConfig.NetworkMode = networkMode
 	created, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Config: &container.Config{
-			Image:  DefaultImage,
+			Image:  image,
 			Cmd:    command,
 			Env:    env,
 			Labels: volumehelper.Labels(),
