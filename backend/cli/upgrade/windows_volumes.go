@@ -10,8 +10,9 @@ import (
 
 // preserveWindowsVolumeBindsInternal pins the volumes of a Windows container like
 // docker.PreserveVolumeMounts does on Linux. That helper splits binds on ':', which
-// breaks drive letters, and adds Mounts entries that Windows Server 2019 cannot start,
-// so volumes are kept as -v binds here.
+// breaks drive letters, so it misses name:C:\path binds and adds a second mount on
+// the same path, which Windows refuses. Volumes are kept as -v binds here, which
+// Docker also matches against VOLUME paths declared by the image.
 func preserveWindowsVolumeBindsInternal(binds []string, mounts []mount.Mount, mountPoints []container.MountPoint) ([]string, []mount.Mount) {
 	binds = slices.Clone(binds)
 	mounts = slices.Clone(mounts)
