@@ -103,8 +103,8 @@ jobs:
         run: |
           $name = "rustic-v${env:RUSTIC_VERSION}-x86_64-pc-windows-gnu.tar.gz"
           $url = "https://github.com/rustic-rs/rustic/releases/download/v${env:RUSTIC_VERSION}/$name"
-          Invoke-WebRequest -UseBasicParsing -OutFile "out\$name" $url
-          $expected = ([string](Invoke-RestMethod "$url.sha256")).Trim().Split()[0]
+          Invoke-WebRequest -UseBasicParsing -MaximumRetryCount 5 -RetryIntervalSec 15 -OutFile "out\$name" $url
+          $expected = ([string](Invoke-RestMethod -MaximumRetryCount 5 -RetryIntervalSec 15 "$url.sha256")).Trim().Split()[0]
           $actual = (Get-FileHash -Algorithm SHA256 "out\$name").Hash
           if ($actual -ne $expected) { Write-Error "Rustic checksum mismatch: got $actual, expected $expected"; exit 1 }
           tar -xzf "out\$name" -C out rustic.exe
@@ -140,12 +140,12 @@ jobs:
             -ldflags "-s -w -X go.getarcane.app/acfs/internal/version.Version=v${env:ACFS_VERSION}" -o ..\..\acfs.exe ./cmd
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          Invoke-WebRequest -UseBasicParsing -OutFile out\busybox.exe "https://frippery.org/files/busybox/${env:BUSYBOX_FILE}"
+          Invoke-WebRequest -UseBasicParsing -MaximumRetryCount 5 -RetryIntervalSec 15 -OutFile out\busybox.exe "https://frippery.org/files/busybox/${env:BUSYBOX_FILE}"
           $actual = (Get-FileHash -Algorithm SHA256 out\busybox.exe).Hash
           if ($actual -ne $env:BUSYBOX_SHA256) { Write-Error "BusyBox checksum mismatch: got $actual"; exit 1 }
 
           $trivyZip = "trivy_${env:TRIVY_VERSION}_windows-64bit.zip"
-          Invoke-WebRequest -UseBasicParsing -OutFile "out\$trivyZip" "https://github.com/aquasecurity/trivy/releases/download/v${env:TRIVY_VERSION}/$trivyZip"
+          Invoke-WebRequest -UseBasicParsing -MaximumRetryCount 5 -RetryIntervalSec 15 -OutFile "out\$trivyZip" "https://github.com/aquasecurity/trivy/releases/download/v${env:TRIVY_VERSION}/$trivyZip"
           $actual = (Get-FileHash -Algorithm SHA256 "out\$trivyZip").Hash
           if ($actual -ne $env:TRIVY_SHA256) { Write-Error "Trivy checksum mismatch: got $actual"; exit 1 }
           Expand-Archive -Path "out\$trivyZip" -DestinationPath out\trivy -Force
@@ -428,8 +428,7 @@ jobs:
           }
           $summary | ConvertTo-Json -Compress -Depth 4
           if ($summary.status -ne 'completed') { Write-Error "Scan status '$($summary.status)': $($summary.error)"; exit 1 }
-          $found = (Invoke-RestMethod -Headers $headers $api).data
-          "Vulnerabilities found: $(@($found.vulnerabilities).Count)"
+          "Vulnerabilities found: $($summary.summary.total)"
           docker rm -f scan-agent | Out-Null
           'Vulnerability scan OK'
 
