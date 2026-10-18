@@ -455,7 +455,8 @@ func (s *Service) runPreparedUpgrade(ctx context.Context, prepared *preparedUpgr
 	switch {
 	case appDataMount == nil:
 	case isWindowsContainer(prepared.current):
-		// Windows Server 2019 fails to start a container given a volume through Mounts; -v binds work.
+		// Docker on Windows matches -v binds against the image's declared VOLUME paths but not
+		// Mounts targets spelled with another case, and Windows refuses two mounts on one path.
 		binds = append(binds, windowsBind(*appDataMount))
 	default:
 		mounts = append(mounts, *appDataMount)
@@ -504,7 +505,7 @@ func (s *Service) runPreparedUpgrade(ctx context.Context, prepared *preparedUpgr
 				SecurityOpt: securityOpt,
 				Privileged:  kit.FromPtr(prepared.current.HostConfig).Privileged,
 				// Windows only mounts the engine named pipe under process isolation, which the
-				// daemon default (hyperv on some hosts) would not give the upgrader.
+				// daemon default (hyperv on Windows 10/11) would not give the upgrader.
 				Isolation: kit.FromPtr(prepared.current.HostConfig).Isolation,
 			},
 			NetworkingConfig: func() *network.NetworkingConfig {
