@@ -458,13 +458,8 @@ func resolveUpgraderRuntimeOptions(
 	selectReachableNetwork func(context.Context, *mobycontainer.InspectResponse, string) string,
 ) ([]string, []mount.Mount, mobycontainer.NetworkMode, error) {
 	// Windows agents reach the engine through a named pipe, mounted into the upgrader at the same path.
-	if pipePath, ok := strings.CutPrefix(strings.TrimSpace(dockerHost), "npipe://"); ok {
-		pipePath = strings.ReplaceAll(pipePath, "/", `\`)
-		return vuln.BuildDockerHostEnv(dockerHost), []mount.Mount{{
-			Type:   mount.TypeNamedPipe,
-			Source: pipePath,
-			Target: pipePath,
-		}}, "", nil
+	if pipeMount, ok := vuln.NamedPipeMount(dockerHost); ok {
+		return vuln.BuildDockerHostEnv(dockerHost), []mount.Mount{pipeMount}, "", nil
 	}
 
 	scheme, socketPath, err := vuln.ParseDockerHost(dockerHost)
