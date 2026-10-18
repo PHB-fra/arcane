@@ -11,6 +11,9 @@ permissions:
 
 env:
   IMAGE: ghcr.io/phb-fra/arcane-agent-windows
+  # Must match rustic.WindowsImage in backend/pkg/libarcane/rustic/image.go.
+  RUSTIC_IMAGE: ghcr.io/phb-fra/rustic-windows
+  RUSTIC_VERSION: 0.11.2
 
 jobs:
   build:
@@ -81,6 +84,35 @@ jobs:
             .\out\windows-image.exe build -base $bases[$release] -exe out\arcane-agent.exe `
               -tag "${env:IMAGE}:e2e-${release}" -out "out\$release\e2e.tar" @labels `
               -label 'com.getarcaneapp.e2e.variant=upgraded'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      # The official Rustic image is Linux only: package its Windows release binary
+      # the same way, for the volume backups of Windows agents.
+      - name: Build Rustic images
+        shell: pwsh
+        run: |
+          $name = "rustic-v${env:RUSTIC_VERSION}-x86_64-pc-windows-gnu.tar.gz"
+          $url = "https://github.com/rustic-rs/rustic/releases/download/v${env:RUSTIC_VERSION}/$name"
+          Invoke-WebRequest -UseBasicParsing -OutFile "out\$name" $url
+          $expected = ([string](Invoke-RestMethod "$url.sha256")).Trim().Split()[0]
+          $actual = (Get-FileHash -Algorithm SHA256 "out\$name").Hash
+          if ($actual -ne $expected) { Write-Error "Rustic checksum mismatch: got $actual, expected $expected"; exit 1 }
+          tar -xzf "out\$name" -C out rustic.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bases = @{
+            'ltsc2019' = 'mcr.microsoft.com/windows/nanoserver:1809'
+            'ltsc2022' = 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+            'ltsc2025' = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
+          }
+          foreach ($release in $bases.Keys) {
+            .\out\windows-image.exe build -profile rustic -base $bases[$release] -exe out\rustic.exe `
+              -tag "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${release}" -out "out\$release\rustic.tar" `
+              -load-out "out\$release\rustic-load.tar" `
+              -label "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY" `
+              -label "org.opencontainers.image.revision=$env:GITHUB_SHA" `
+              -label "org.opencontainers.image.version=$env:RUSTIC_VERSION" `
+              -label 'org.opencontainers.image.description=Official Rustic Windows release binary on nanoserver, for unofficial Arcane Windows agents.'
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -183,6 +215,64 @@ jobs:
           docker logs smoke
           docker rm -f smoke | Out-Null
           if (-not $ok) { Write-Error 'The agent did not answer /api/health'; exit 1 }
+
+      # Backs up a volume and restores it through the agent API, as the manager does.
+      # The Rustic image under test is tagged locally, so the agent does not pull it.
+      - name: Volume backup test
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $rustic = "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}"
+          docker load -i out\rustic-load.tar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker tag "${rustic}-${{ matrix.release }}" $rustic
+          docker run --rm --isolation process $rustic --version
+          if ($LASTEXITCODE -ne 0) { Write-Error 'rustic.exe does not start in the Rustic image'; exit 1 }
+
+          $agent = "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview"
+          docker volume create backup-e2e | Out-Null
+          docker run --rm --isolation process -v 'backup-e2e:C:\volume' $agent `
+            cmd /c 'mkdir C:\volume\sub && echo hello> C:\volume\sub\hello.txt'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          docker run -d --name backup-agent --isolation process `
+            -e AGENT_TOKEN=arc_backuptest -e MANAGER_API_URL=http://127.0.0.1:9 `
+            -v \\.\pipe\docker_engine:\\.\pipe\docker_engine `
+            -v 'backup-agent-data:C:\app\data' `
+            $agent
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $ip = $null
+          foreach ($i in 1..30) {
+            $ip = docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' backup-agent
+            try { if ((Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 "http://${ip}:3553/api/health").StatusCode -eq 200) { break } } catch { }
+            Start-Sleep -Seconds 2
+          }
+          $headers = @{ 'X-Arcane-Agent-Token' = 'arc_backuptest' }
+          $api = "http://${ip}:3553/api/environments/0/volumes/backup-e2e"
+
+          $id = (Invoke-RestMethod -Method Post -ContentType 'application/json' -Body '{}' -Headers $headers "$api/backups").data.id
+          "Backup $id started"
+          $status = ''
+          foreach ($i in 1..120) {
+            $entry = (Invoke-RestMethod -Headers $headers "$api/backups").data | Where-Object id -eq $id
+            $status = $entry.status
+            if ($status -eq 'failed') { Write-Error "Backup failed: $($entry.error)"; exit 1 }
+            if ($status -eq 'succeeded') { break }
+            Start-Sleep -Seconds 2
+          }
+          if ($status -ne 'succeeded') { Write-Error "Backup did not finish (status '$status')"; exit 1 }
+          "Backup succeeded, size $($entry.size)"
+
+          # Change the volume, then restore: the file comes back and the new one goes away.
+          docker run --rm --isolation process -v 'backup-e2e:C:\volume' $agent `
+            cmd /c 'del /q C:\volume\sub\hello.txt && echo changed> C:\volume\extra.txt'
+          Invoke-RestMethod -Method Post -Headers $headers "$api/backups/$id/restore" | ConvertTo-Json -Compress
+          $restored = docker run --rm --isolation process -v 'backup-e2e:C:\volume' $agent cmd /c 'type C:\volume\sub\hello.txt'
+          if ("$restored".Trim() -ne 'hello') { Write-Error "Restored file content: '$restored'"; exit 1 }
+          docker run --rm --isolation process -v 'backup-e2e:C:\volume' $agent cmd /c 'if exist C:\volume\extra.txt exit 1'
+          if ($LASTEXITCODE -ne 0) { Write-Error 'The restore kept a file absent from the backup'; exit 1 }
+          docker rm -f backup-agent | Out-Null
+          'Volume backup OK'
 
       # Runs the agent like deploy-arcane-agent-windows.ps1 and triggers its self-upgrade
       # through the agent API, as the manager does. The registry tag holds the e2e
@@ -319,10 +409,21 @@ jobs:
             -tag "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview" -tag "${env:IMAGE}:${{ matrix.release }}-preview"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Push Rustic image
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: push-rustic
+        shell: pwsh
+        run: |
+          .\out\windows-image.exe push -tar out\rustic.tar -tag "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${{ matrix.release }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Summary
         shell: pwsh
         run: |
           "| ``${{ matrix.release }}-preview`` | ``${{ steps.push.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
+          "| rustic ``v${env:RUSTIC_VERSION}-${{ matrix.release }}`` | ``${{ steps.push-rustic.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
 
       # The attestation action pushes to GHCR with the Docker credentials.
       - name: Login to GHCR
@@ -337,6 +438,13 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image attestation (Rustic)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.RUSTIC_IMAGE }}
+          subject-digest: ${{ steps.push-rustic.outputs.digest }}
           push-to-registry: true
 
   # Windows hosts pull the entry matching their own release from these tags.
@@ -373,6 +481,20 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
+      # The tag Arcane pulls: each Windows host gets the Rustic image of its release.
+      - name: Push Rustic multi-release index
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: index-rustic
+        shell: pwsh
+        run: |
+          $from = foreach ($release in 'ltsc2019', 'ltsc2022', 'ltsc2025') {
+            '-from', "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${release}"
+          }
+          .\out\windows-image.exe index -tag "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}" @from
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Login to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -385,4 +507,11 @@ jobs:
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image attestation (Rustic multi-release index)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.RUSTIC_IMAGE }}
+          subject-digest: ${{ steps.index-rustic.outputs.digest }}
           push-to-registry: true
