@@ -11,11 +11,12 @@ Images, built by [this workflow](.github/workflows/windows-agent-image.yml) from
 | `ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview` | Windows Server 2019, 2022 or 2025: Docker picks the matching image |
 | `ghcr.io/phb-fra/arcane-agent-windows:ltsc2025-preview` | Windows Server 2025 |
 | `ghcr.io/phb-fra/arcane-agent-windows:ltsc2022-preview` | Windows Server 2022 |
-| `ghcr.io/phb-fra/arcane-agent-windows:ltsc2019-preview` | Windows Server 2019 |
+| `ghcr.io/phb-fra/arcane-agent-windows:ltsc2019-preview` | Windows Server 2019 (untested, see below) |
 
 Versioned tags (`2.16.1-ltsc-preview`, ...) are published as well. All images contain the same
-`arcane-agent.exe`. CI starts the 2022 and 2025 images on matching runners; no GitHub runner
-runs Windows Server 2019, so that image is not started in CI.
+`arcane-agent.exe`. CI starts the 2022 and 2025 images on matching runners and tests the
+agent self-upgrade on both. No GitHub runner runs Windows Server 2019, so that image is not
+tested and is published as is.
 
 ## Changes compared with upstream `main`
 
@@ -72,9 +73,11 @@ gh attestation verify oci://ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview --
 ## Known limitations
 
 - Self-upgrade (manual or auto-update) is tested end to end in CI on Windows Server 2022 and
-  2025. On Windows Server 2019 it is still under test: it froze a host during earlier
-  attempts. If in doubt, exclude the agent container from auto-update on the manager and
-  update with `docker/examples/deploy-arcane-agent-windows.ps1`.
+  2025.
+- Windows Server 2019 is not supported for self-upgrade: on a 2019 test host, starting the
+  recreated agent crashed the host (bugcheck 0xC2, BAD_POOL_CALLER). Exclude the agent
+  container from auto-update on the manager and update with
+  `docker/examples/deploy-arcane-agent-windows.ps1`.
 - System backup/restore and container self-detection assume a Linux container and are not
   expected to work.
 - HTTPS to the manager relies on the nanoserver root certificate store.
