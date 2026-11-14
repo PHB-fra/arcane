@@ -1,0 +1,41 @@
+# Unofficial preview: Arcane agent as a Windows container, deployed with Compose.
+# Requires Docker Engine in Windows containers mode (process isolation) on
+# Windows Server 2019, 2022 or 2025.
+#
+# Arcane v3 model: the agent connects OUTBOUND to the manager over a tunnel and
+# enrolls with an enrollment token (the direct/polling agent and its inbound port
+# 3553 were removed in v3). The manager must be running v3.
+#
+# Put the two secrets/URL in a .env file next to this one (it is gitignored):
+#   ARCANE_MANAGER_API_URL=https://your-manager
+#   ARCANE_AGENT_TOKEN=arc_...        # a fresh enrollment token from the v3 manager
+#
+#   docker compose pull
+#   docker compose up -d
+#   docker compose logs -f
+
+services:
+  arcane-agent:
+    image: ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview
+    container_name: arcane-agent
+    restart: unless-stopped
+    isolation: process
+    environment:
+      # ARCANE_AGENT=true and ARCANE_ENVIRONMENT=production are already baked into
+      # the image; kept here for readability.
+      ARCANE_AGENT: "true"
+      ARCANE_MANAGER_API_URL: ${ARCANE_MANAGER_API_URL}
+      ARCANE_AGENT_TOKEN: ${ARCANE_AGENT_TOKEN}
+      ARCANE_AGENT_TRANSPORT: websocket        # auto | grpc | websocket
+    volumes:
+      # Docker engine named pipe (long syntax: backslashes break the short form).
+      - type: npipe
+        source: '\\.\pipe\docker_engine'
+        target: '\\.\pipe\docker_engine'
+      # Agent data (long syntax: the ':' in C:\ is mis-split by the short form).
+      - type: volume
+        source: arcane-agent-data
+        target: C:\app\data
+
+volumes:
+  arcane-agent-data:
