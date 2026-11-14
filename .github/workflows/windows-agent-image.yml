@@ -1,0 +1,469 @@
+name: Windows agent image (unofficial preview)
+
+on:
+  push:
+    # windows-agent-e2e builds and tests without publishing the preview tags.
+    branches: [windows-agent-preview, windows-agent-e2e]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/phb-fra/arcane-agent-windows
+  # Must match rustic.WindowsImage in backend/pkg/rustic/image.go.
+  RUSTIC_IMAGE: ghcr.io/phb-fra/rustic-windows
+  RUSTIC_VERSION: 0.11.2
+  # Must match volumehelper.WindowsToolsImage in backend/pkg/volumes/helper.go.
+  TOOLS_IMAGE: ghcr.io/phb-fra/arcane-tools-windows
+  # Same acfs as ghcr.io/getarcaneapp/tools, and a pinned BusyBox for Windows (frippery.org).
+  ACFS_VERSION: 0.6.1
+  BUSYBOX_FILE: busybox-w64-FRP-6075-g169694ebd.exe
+  BUSYBOX_SHA256: 07bb1e5b095b00d68a695481f9240879f33c5724b40aa2308f999d54ed78f075
+  # Same Trivy as ghcr.io/getarcaneapp/tools; the checksum is from its release checksums file.
+  TRIVY_VERSION: 0.75.0
+  TRIVY_SHA256: 4e43bd71a30f51aee39525f60f2b47043af77eb8df8fe082aae4372b69c6660f
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.exe.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: |
+            backend/go.sum
+            docker/windows-image/go.sum
+
+      - name: Build arcane-agent.exe
+        id: exe
+        shell: pwsh
+        run: |
+          $meta = Get-Content .arcane.json -Raw | ConvertFrom-Json
+          $pkg = 'getarcane.dev/arcane/v3/internal/config'
+          $buildTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          Push-Location backend
+          go build -tags exclude_frontend -trimpath `
+            -ldflags "-w -s -X $pkg.Version=$($meta.version) -X $pkg.Revision=$env:GITHUB_SHA -X $pkg.BuildTime=$buildTime" `
+            -o ..\out\arcane-agent.exe .\cmd\main.go
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+          "VERSION=$($meta.version)" >> $env:GITHUB_ENV
+          "version=$($meta.version)" >> $env:GITHUB_OUTPUT
+
+      # The images are assembled without a Docker daemon: a Windows runner can only
+      # build images for its own release with process isolation.
+      - name: Build images
+        shell: pwsh
+        run: |
+          $env:GOWORK = 'off'
+          go build -C docker/windows-image -o ..\..\out\windows-image.exe .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $labels = @(
+            '-label', "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY",
+            '-label', "org.opencontainers.image.revision=$env:GITHUB_SHA",
+            '-label', "org.opencontainers.image.version=$env:VERSION",
+            '-label', 'org.opencontainers.image.description=Unofficial preview of the Arcane agent as a Windows Server container. Not supported by the Arcane maintainers.'
+          )
+          $bases = @{
+            'ltsc2019' = 'mcr.microsoft.com/windows/nanoserver:1809'
+            'ltsc2022' = 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+            'ltsc2025' = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
+          }
+          foreach ($release in $bases.Keys) {
+            New-Item -ItemType Directory -Force "out\$release" | Out-Null
+            .\out\windows-image.exe build -base $bases[$release] -exe out\arcane-agent.exe `
+              -tag "${env:IMAGE}:${env:VERSION}-${release}-preview" -out "out\$release\image.tar" `
+              -load-out "out\$release\load.tar" @labels
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          # Same agent with one extra label: the newer image the self-upgrade test moves to.
+          foreach ($release in 'ltsc2022', 'ltsc2025') {
+            .\out\windows-image.exe build -base $bases[$release] -exe out\arcane-agent.exe `
+              -tag "${env:IMAGE}:e2e-${release}" -out "out\$release\e2e.tar" @labels `
+              -label 'com.getarcaneapp.e2e.variant=upgraded'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      # The official Rustic image is Linux only: package its Windows release binary
+      # the same way, for the volume backups of Windows agents.
+      - name: Build Rustic images
+        shell: pwsh
+        run: |
+          $name = "rustic-v${env:RUSTIC_VERSION}-x86_64-pc-windows-gnu.tar.gz"
+          $url = "https://github.com/rustic-rs/rustic/releases/download/v${env:RUSTIC_VERSION}/$name"
+          Invoke-WebRequest -UseBasicParsing -MaximumRetryCount 5 -RetryIntervalSec 15 -OutFile "out\$name" $url
+          $expected = ([string](Invoke-RestMethod -MaximumRetryCount 5 -RetryIntervalSec 15 "$url.sha256")).Trim().Split()[0]
+          $actual = (Get-FileHash -Algorithm SHA256 "out\$name").Hash
+          if ($actual -ne $expected) { Write-Error "Rustic checksum mismatch: got $actual, expected $expected"; exit 1 }
+          tar -xzf "out\$name" -C out rustic.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $bases = @{
+            'ltsc2019' = 'mcr.microsoft.com/windows/nanoserver:1809'
+            'ltsc2022' = 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+            'ltsc2025' = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
+          }
+          foreach ($release in $bases.Keys) {
+            .\out\windows-image.exe build -profile rustic -base $bases[$release] -exe out\rustic.exe `
+              -tag "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${release}" -out "out\$release\rustic.tar" `
+              -load-out "out\$release\rustic-load.tar" `
+              -label "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY" `
+              -label "org.opencontainers.image.revision=$env:GITHUB_SHA" `
+              -label "org.opencontainers.image.version=$env:RUSTIC_VERSION" `
+              -label 'org.opencontainers.image.description=Official Rustic Windows release binary on nanoserver, for unofficial Arcane Windows agents.'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      # Windows counterpart of the tools image used by the volume helper and scan
+      # containers: the same BusyBox applets as ghcr.io/getarcaneapp/tools, acfs and Trivy.
+      - name: Build tools images
+        shell: pwsh
+        run: |
+          git clone -q --depth 1 --branch "acfs/v${env:ACFS_VERSION}" https://github.com/getarcaneapp/kit.git out\kit
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:GOWORK = 'off'
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          go build -C out\kit\acfs -trimpath -buildvcs=false `
+            -ldflags "-s -w -X go.getarcane.app/acfs/internal/version.Version=v${env:ACFS_VERSION}" -o ..\..\acfs.exe ./cmd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          Invoke-WebRequest -UseBasicParsing -MaximumRetryCount 5 -RetryIntervalSec 15 -OutFile out\busybox.exe "https://frippery.org/files/busybox/${env:BUSYBOX_FILE}"
+          $actual = (Get-FileHash -Algorithm SHA256 out\busybox.exe).Hash
+          if ($actual -ne $env:BUSYBOX_SHA256) { Write-Error "BusyBox checksum mismatch: got $actual"; exit 1 }
+
+          $trivyZip = "trivy_${env:TRIVY_VERSION}_windows-64bit.zip"
+          Invoke-WebRequest -UseBasicParsing -MaximumRetryCount 5 -RetryIntervalSec 15 -OutFile "out\$trivyZip" "https://github.com/aquasecurity/trivy/releases/download/v${env:TRIVY_VERSION}/$trivyZip"
+          $actual = (Get-FileHash -Algorithm SHA256 "out\$trivyZip").Hash
+          if ($actual -ne $env:TRIVY_SHA256) { Write-Error "Trivy checksum mismatch: got $actual"; exit 1 }
+          Expand-Archive -Path "out\$trivyZip" -DestinationPath out\trivy -Force
+
+          # BusyBox picks the applet from its executable name, so each applet is a copy.
+          $applets = 'sh', 'sleep', 'find', 'gzip', 'stat', 'readlink', 'head', 'rm', 'mkdir', 'mv', 'rmdir', 'mktemp', 'tar', 'test'
+          $files = @('-file', 'tools/bin/acfs.exe=out/acfs.exe', '-file', 'tools/bin/busybox.exe=out/busybox.exe', '-file', 'tools/bin/trivy.exe=out/trivy/trivy.exe')
+          foreach ($applet in $applets) { $files += '-file', "tools/bin/$applet.exe=out/busybox.exe" }
+          $bases = @{
+            'ltsc2019' = 'mcr.microsoft.com/windows/nanoserver:1809'
+            'ltsc2022' = 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+            'ltsc2025' = 'mcr.microsoft.com/windows/nanoserver:ltsc2025'
+          }
+          foreach ($release in $bases.Keys) {
+            .\out\windows-image.exe build -profile tools -base $bases[$release] @files `
+              -tag "${env:TOOLS_IMAGE}:${release}" -out "out\$release\tools.tar" `
+              -load-out "out\$release\tools-load.tar" `
+              -label "org.opencontainers.image.source=https://github.com/$env:GITHUB_REPOSITORY" `
+              -label "org.opencontainers.image.revision=$env:GITHUB_SHA" `
+              -label 'org.opencontainers.image.description=BusyBox for Windows, acfs and Trivy on nanoserver, for the helper containers of unofficial Arcane Windows agents.'
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: arcane-agent-windows-amd64
+          path: |
+            out/arcane-agent.exe
+            out/windows-image.exe
+
+      - name: Upload ltsc2019 image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-ltsc2019
+          path: out/ltsc2019/
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload ltsc2022 image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-ltsc2022
+          path: out/ltsc2022/
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload ltsc2025 image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-ltsc2025
+          path: out/ltsc2025/
+          retention-days: 1
+          compression-level: 0
+
+  # Process isolation only runs an image on the matching Windows release, so each
+  # image is started on its own runner. No GitHub runner runs Windows Server 2019.
+  smoke:
+    needs: build
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - release: ltsc2022
+            runner: windows-2022
+          - release: ltsc2025
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: arcane-agent-windows-amd64
+          path: out
+
+      - name: Download image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-${{ matrix.release }}
+          path: out
+
+      - name: Start Docker engine
+        shell: pwsh
+        run: |
+          $svc = Get-Service docker -ErrorAction SilentlyContinue
+          if (-not $svc) { Write-Error 'The Docker engine service is not installed on this runner'; exit 1 }
+          if ($svc.Status -ne 'Running') { Start-Service docker }
+          foreach ($i in 1..30) {
+            docker version --format '{{.Server.Os}} {{.Server.Version}}' 2>$null
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            Start-Sleep -Seconds 2
+          }
+          Write-Error 'The Docker engine did not start'; exit 1
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          docker load -i out\load.tar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # v3 agent: outbound tunnel to the manager, no inbound API. The dummy manager is
+          # unreachable, so the agent keeps retrying the tunnel; we only check it passes config
+          # validation and stays up (it must not exit like a direct agent removed in v3 would).
+          docker run -d --name smoke --isolation process `
+            -e ARCANE_AGENT=true `
+            -e ARCANE_MANAGER_API_URL=http://127.0.0.1:9 `
+            -e ARCANE_AGENT_TOKEN=arc_smoketest `
+            -e ARCANE_AGENT_TRANSPORT=websocket `
+            -v \\.\pipe\docker_engine:\\.\pipe\docker_engine `
+            "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Start-Sleep -Seconds 15
+          $running = docker inspect -f '{{.State.Running}}' smoke
+          docker logs smoke
+          docker rm -f smoke | Out-Null
+          if ($running -ne 'true') { Write-Error 'The agent exited instead of staying up (config/startup error)'; exit 1 }
+          'Agent smoke OK'
+
+      # The helper binaries run standalone; full helper e2e (backup/browse/scan) and the
+      # self-upgrade test drove the agent through its inbound API, removed in v3 - they now
+      # need a real v3 manager over the tunnel and are validated on the live manager instead.
+      - name: Helper images smoke
+        shell: pwsh
+        run: |
+          docker load -i out\rustic-load.tar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker run --rm --isolation process "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${{ matrix.release }}" --version
+          if ($LASTEXITCODE -ne 0) { Write-Error 'rustic.exe does not start in the Rustic image'; exit 1 }
+          docker load -i out\tools-load.tar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          docker run --rm --isolation process "${env:TOOLS_IMAGE}:${{ matrix.release }}" trivy --version
+          if ($LASTEXITCODE -ne 0) { Write-Error 'trivy.exe does not start in the tools image'; exit 1 }
+          'Helper images smoke OK'
+
+  publish:
+    needs: [build, smoke]
+    if: github.ref == 'refs/heads/windows-agent-preview'
+    strategy:
+      matrix:
+        release: [ltsc2019, ltsc2022, ltsc2025]
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: arcane-agent-windows-amd64
+          path: out
+
+      - name: Download image
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-${{ matrix.release }}
+          path: out
+
+      - name: Push image
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: push
+        shell: pwsh
+        run: |
+          .\out\windows-image.exe push -tar out\image.tar `
+            -tag "${env:IMAGE}:${env:VERSION}-${{ matrix.release }}-preview" -tag "${env:IMAGE}:${{ matrix.release }}-preview"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Push Rustic image
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: push-rustic
+        shell: pwsh
+        run: |
+          .\out\windows-image.exe push -tar out\rustic.tar -tag "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${{ matrix.release }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Push tools image
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: push-tools
+        shell: pwsh
+        run: |
+          .\out\windows-image.exe push -tar out\tools.tar -tag "${env:TOOLS_IMAGE}:${{ matrix.release }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          "| tools ``${{ matrix.release }}`` | ``${{ steps.push-tools.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
+          "| ``${{ matrix.release }}-preview`` | ``${{ steps.push.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
+          "| rustic ``v${env:RUSTIC_VERSION}-${{ matrix.release }}`` | ``${{ steps.push-rustic.outputs.digest }}`` |" >> $env:GITHUB_STEP_SUMMARY
+
+      # The attestation action pushes to GHCR with the Docker credentials.
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image attestation (tools)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.TOOLS_IMAGE }}
+          subject-digest: ${{ steps.push-tools.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image attestation (Rustic)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.RUSTIC_IMAGE }}
+          subject-digest: ${{ steps.push-rustic.outputs.digest }}
+          push-to-registry: true
+
+  # Windows hosts pull the entry matching their own release from these tags.
+  index:
+    needs: [build, publish]
+    if: github.ref == 'refs/heads/windows-agent-preview'
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: Download tools
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: arcane-agent-windows-amd64
+          path: out
+
+      - name: Push multi-release index
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: index
+        shell: pwsh
+        run: |
+          $from = foreach ($release in 'ltsc2019', 'ltsc2022', 'ltsc2025') {
+            '-from', "${env:IMAGE}:${env:VERSION}-${release}-preview"
+          }
+          foreach ($tag in "${env:VERSION}-ltsc-preview", 'ltsc-preview') {
+            .\out\windows-image.exe index -tag "${env:IMAGE}:$tag" @from
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+      # The tag Arcane pulls: each Windows host gets the tools image of its release.
+      - name: Push tools multi-release index
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: index-tools
+        shell: pwsh
+        run: |
+          $from = foreach ($release in 'ltsc2019', 'ltsc2022', 'ltsc2025') {
+            '-from', "${env:TOOLS_IMAGE}:${release}"
+          }
+          .\out\windows-image.exe index -tag "${env:TOOLS_IMAGE}:latest" @from
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # The tag Arcane pulls: each Windows host gets the Rustic image of its release.
+      - name: Push Rustic multi-release index
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        id: index-rustic
+        shell: pwsh
+        run: |
+          $from = foreach ($release in 'ltsc2019', 'ltsc2022', 'ltsc2025') {
+            '-from', "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${release}"
+          }
+          .\out\windows-image.exe index -tag "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}" @from
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image attestation (multi-release index)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image attestation (Rustic multi-release index)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.RUSTIC_IMAGE }}
+          subject-digest: ${{ steps.index-rustic.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image attestation (tools multi-release index)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.TOOLS_IMAGE }}
+          subject-digest: ${{ steps.index-tools.outputs.digest }}
+          push-to-registry: true

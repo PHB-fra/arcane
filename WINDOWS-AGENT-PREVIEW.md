@@ -1,0 +1,87 @@
+# Arcane agent on Windows Server (unofficial preview)
+
+This branch builds the Arcane **agent** as a Windows container for Windows Server 2019, 2022 and 2025. It is **not an official
+Arcane image** and is not supported by the Arcane maintainers. Feedback goes to
+[Discussion #4019](https://github.com/getarcaneapp/arcane/discussions/4019).
+
+Images, built by [this workflow](.github/workflows/windows-agent-image.yml) from this branch only:
+
+| Tag | Host |
+| --- | --- |
+| `ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview` | Windows Server 2019, 2022 or 2025: Docker picks the matching image |
+| `ghcr.io/phb-fra/arcane-agent-windows:ltsc2025-preview` | Windows Server 2025 |
+| `ghcr.io/phb-fra/arcane-agent-windows:ltsc2022-preview` | Windows Server 2022 |
+| `ghcr.io/phb-fra/arcane-agent-windows:ltsc2019-preview` | Windows Server 2019 (untested, see below) |
+
+Versioned tags (`2.16.1-ltsc-preview`, ...) are published as well. All images contain the same
+`arcane-agent.exe`. CI starts the 2022 and 2025 images on matching runners and tests the
+agent self-upgrade on both. No GitHub runner runs Windows Server 2019, so that image is not
+tested and is published as is.
+
+## Changes compared with upstream `main`
+
+- `backend/internal/system/children/backup/children/snapshots`: Unix-only owner lookup moved
+  behind build tags.
+- `backend/go.mod`: copacetic v0.15.0 replaced by
+  [PHB-fra/copacetic@arcane-windows-v0.15.0](https://github.com/PHB-fra/copacetic/tree/arcane-windows-v0.15.0)
+  (v0.15.0 plus the fix proposed in project-copacetic/copacetic#1735), until a copacetic
+  release includes it.
+- `docker/windows-image`: assembles the nanoserver 1809 (2019), ltsc2022 and ltsc2025 images without
+  a Docker daemon, so a single Windows Server 2022 runner builds all three.
+- `docker/Dockerfile-agent-windows`: equivalent Dockerfile, to build on a Windows host.
+
+## Requirements
+
+- Windows Server 2019, 2022 or 2025 with Docker Engine in Windows containers mode (process isolation).
+  On Windows 11, use the `ltsc2022-preview` tag with `--isolation hyperv`.
+- A named volume on `C:\app\data` (`-v arcane-agent-data:C:\app\data`). The image declares no
+  volume, so without it the agent data is lost when the container is recreated.
+
+## Run
+
+Arcane v3 removed the direct/polling agent (inbound port 3553): the agent now connects
+**outbound** to the manager over a tunnel and enrolls with an enrollment token. The manager
+must be running v3, and `ARCANE_AGENT_TOKEN` must be a fresh enrollment token it issued.
+
+```powershell
+docker run -d --name arcane-agent --restart unless-stopped --isolation process `
+  -e ARCANE_AGENT=true `
+  -e ARCANE_MANAGER_API_URL=https://manager.example `
+  -e ARCANE_AGENT_TOKEN=arc_... `
+  -e ARCANE_AGENT_TRANSPORT=websocket `
+  -v \\.\pipe\docker_engine:\\.\pipe\docker_engine `
+  -v arcane-agent-data:C:\app\data `
+  ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview
+```
+
+`ARCANE_AGENT_TRANSPORT` is `auto` (default), `grpc` or `websocket`. The image already sets
+`ARCANE_AGENT=true` and `ARCANE_ENVIRONMENT=production`.
+
+[`docker/examples/deploy-arcane-agent-windows.ps1`](docker/examples/deploy-arcane-agent-windows.ps1)
+does the same in one step: it checks that the engine runs Windows containers, pulls the image
+(or loads a tarball with `-Tarball` on hosts without access to ghcr.io), replaces any existing
+container and prints its first logs.
+
+```powershell
+$env:ARCANE_AGENT_TOKEN = 'arc_...'   # enrollment token from the v3 manager
+.\deploy-arcane-agent-windows.ps1 -ManagerUrl https://manager.example
+.\deploy-arcane-agent-windows.ps1 -ManagerUrl http://manager:3552 -Transport grpc
+```
+
+Verify the image provenance:
+
+```powershell
+gh attestation verify oci://ghcr.io/phb-fra/arcane-agent-windows:ltsc-preview --owner PHB-fra
+```
+
+## Known limitations
+
+- Self-upgrade (manual or auto-update) is tested end to end in CI on Windows Server 2022 and
+  2025.
+- Windows Server 2019 is not supported for self-upgrade: on a 2019 test host, starting the
+  recreated agent crashed the host (bugcheck 0xC2, BAD_POOL_CALLER). Exclude the agent
+  container from auto-update on the manager and update with
+  `docker/examples/deploy-arcane-agent-windows.ps1`.
+- System backup/restore and container self-detection assume a Linux container and are not
+  expected to work.
+- HTTPS to the manager relies on the nanoserver root certificate store.
