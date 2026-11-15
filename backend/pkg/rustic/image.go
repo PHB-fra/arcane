@@ -7,7 +7,7 @@ const (
 
 	// WindowsImage packages the official Rustic Windows binary for Windows Docker hosts,
 	// where DefaultImage has no variant.
-	WindowsImage = "ghcr.io/phb-fra/rustic-windows:v0.11.2"
+	WindowsImage = "ghcr.io/phb-fra/rustic-windows:v0.11.4"
 
 	CacheVolume = "arcane-rustic-cache"
 )

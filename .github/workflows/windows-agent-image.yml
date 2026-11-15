@@ -13,7 +13,7 @@ env:
   IMAGE: ghcr.io/phb-fra/arcane-agent-windows
   # Must match rustic.WindowsImage in backend/pkg/rustic/image.go.
   RUSTIC_IMAGE: ghcr.io/phb-fra/rustic-windows
-  RUSTIC_VERSION: 0.11.2
+  RUSTIC_VERSION: 0.11.4
   # Must match volumehelper.WindowsToolsImage in backend/pkg/volumes/helper.go.
   TOOLS_IMAGE: ghcr.io/phb-fra/arcane-tools-windows
   # Same acfs as ghcr.io/getarcaneapp/tools, and a pinned BusyBox for Windows (frippery.org).
@@ -21,8 +21,8 @@ env:
   BUSYBOX_FILE: busybox-w64-FRP-6075-g169694ebd.exe
   BUSYBOX_SHA256: 07bb1e5b095b00d68a695481f9240879f33c5724b40aa2308f999d54ed78f075
   # Same Trivy as ghcr.io/getarcaneapp/tools; the checksum is from its release checksums file.
-  TRIVY_VERSION: 0.75.0
-  TRIVY_SHA256: 4e43bd71a30f51aee39525f60f2b47043af77eb8df8fe082aae4372b69c6660f
+  TRIVY_VERSION: 0.76.2
+  TRIVY_SHA256: 691f737a7e5566a673c3a74dab9160552ec32101e953b659e5c77443d16dddb6
 
 jobs:
   build:
