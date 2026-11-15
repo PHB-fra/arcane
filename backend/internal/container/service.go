@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1585,10 +1586,16 @@ func (s *ContainerService) GetContainerDetails(ctx context.Context, id string) (
 }
 
 func (s *ContainerService) GetContainerProcesses(ctx context.Context, containerID string) (types.ContainerProcesses, error) {
+	// Windows containers reject any arguments to top ("Windows does not support
+	// arguments to top"), so there the processes are listed with no ps arguments.
+	psArgsAttempts := containerProcessesPsArgs
+	if runtime.GOOS == "windows" {
+		psArgsAttempts = [][]string{nil}
+	}
 	result, err := s.dockerService.Call(ctx, func(ctx context.Context, dockerClient *client.Client) (client.ContainerTopResult, error) {
 		var result client.ContainerTopResult
 		var err error
-		for _, args := range containerProcessesPsArgs {
+		for _, args := range psArgsAttempts {
 			result, err = dockerClient.ContainerTop(ctx, containerID, client.ContainerTopOptions{Arguments: args})
 			if err == nil || errdefs.IsNotFound(err) || errdefs.IsConflict(err) || ctx.Err() != nil {
 				break
