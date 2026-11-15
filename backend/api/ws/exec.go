@@ -1,7 +1,6 @@
 package ws
 
 import (
-	"cmp"
 	"context"
 	"encoding/json/v2"
 	"errors"
@@ -9,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +27,16 @@ func (h *WebSocketHandler) ContainerExec(c *echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]any{"success": false, "error": "Container ID is required"})
 	}
 
-	shell := cmp.Or(c.QueryParam("shell"), "/bin/sh")
+	shell := strings.TrimSpace(c.QueryParam("shell"))
+	if runtime.GOOS == "windows" {
+		// Windows containers have no /bin/sh; use cmd.exe unless a Windows shell
+		// was requested explicitly (e.g. powershell.exe).
+		if shell == "" || shell == "sh" || shell == "bash" || strings.HasPrefix(shell, "/") {
+			shell = "cmd.exe"
+		}
+	} else if shell == "" {
+		shell = "/bin/sh"
+	}
 	cols, _ := strconv.ParseUint(c.QueryParam("cols"), 10, 16)
 	rows, _ := strconv.ParseUint(c.QueryParam("rows"), 10, 16)
 
