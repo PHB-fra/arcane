@@ -140,7 +140,17 @@ jobs:
             -ldflags "-s -w -X go.getarcane.app/acfs/internal/version.Version=v${env:ACFS_VERSION}" -o ..\..\acfs.exe ./cmd
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          Invoke-WebRequest -UseBasicParsing -MaximumRetryCount 5 -RetryIntervalSec 15 -OutFile out\busybox.exe "https://frippery.org/files/busybox/${env:BUSYBOX_FILE}"
+          # frippery.org intermittently answers 403 to the runner; -MaximumRetryCount does not
+          # retry 403, so retry the download explicitly with a browser user agent.
+          $bbUrl = "https://frippery.org/files/busybox/${env:BUSYBOX_FILE}"
+          for ($i = 1; $i -le 6; $i++) {
+            try { Invoke-WebRequest -UseBasicParsing -UserAgent 'Mozilla/5.0' -OutFile out\busybox.exe $bbUrl; break }
+            catch {
+              Write-Host "BusyBox download attempt $i failed: $($_.Exception.Message)"
+              if ($i -eq 6) { throw }
+              Start-Sleep -Seconds 20
+            }
+          }
           $actual = (Get-FileHash -Algorithm SHA256 out\busybox.exe).Hash
           if ($actual -ne $env:BUSYBOX_SHA256) { Write-Error "BusyBox checksum mismatch: got $actual"; exit 1 }
 
