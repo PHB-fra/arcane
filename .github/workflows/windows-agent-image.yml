@@ -31,6 +31,7 @@ jobs:
       contents: read
     outputs:
       version: ${{ steps.exe.outputs.version }}
+      tools_ok: ${{ steps.tools.outputs.ok }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -128,6 +129,12 @@ jobs:
       # Windows counterpart of the tools image used by the volume helper and scan
       # containers: the same BusyBox applets as ghcr.io/getarcaneapp/tools, acfs and Trivy.
       - name: Build tools images
+        id: tools
+        # frippery.org (BusyBox) periodically 403s the runner. The tools image is
+        # version-independent of the agent and already on GHCR, so a tools failure must
+        # not block republishing the agent: keep going and gate the tools publish/index on
+        # steps.tools.outputs.ok (see the build job's tools_ok output).
+        continue-on-error: true
         shell: pwsh
         run: |
           git clone -q --depth 1 --branch "acfs/v${env:ACFS_VERSION}" https://github.com/getarcaneapp/kit.git out\kit
@@ -178,6 +185,8 @@ jobs:
               -label 'org.opencontainers.image.description=BusyBox for Windows, acfs and Trivy on nanoserver, for the helper containers of unofficial Arcane Windows agents.'
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+          # Reached only when every tools image built: lets the publish/index gate on it.
+          "ok=true" >> $env:GITHUB_OUTPUT
 
       - name: Upload binaries
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -288,10 +297,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           docker run --rm --isolation process "${env:RUSTIC_IMAGE}:v${env:RUSTIC_VERSION}-${{ matrix.release }}" --version
           if ($LASTEXITCODE -ne 0) { Write-Error 'rustic.exe does not start in the Rustic image'; exit 1 }
-          docker load -i out\tools-load.tar
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          docker run --rm --isolation process "${env:TOOLS_IMAGE}:${{ matrix.release }}" trivy --version
-          if ($LASTEXITCODE -ne 0) { Write-Error 'trivy.exe does not start in the tools image'; exit 1 }
+          if (Test-Path out\tools-load.tar) {
+            docker load -i out\tools-load.tar
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            docker run --rm --isolation process "${env:TOOLS_IMAGE}:${{ matrix.release }}" trivy --version
+            if ($LASTEXITCODE -ne 0) { Write-Error 'trivy.exe does not start in the tools image'; exit 1 }
+          } else {
+            'Tools image not built this run (BusyBox source unavailable); skipping tools smoke.'
+          }
           'Helper images smoke OK'
 
   publish:
@@ -343,6 +356,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Push tools image
+        if: needs.build.outputs.tools_ok == 'true'
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
@@ -375,6 +389,7 @@ jobs:
           push-to-registry: true
 
       - name: Image attestation (tools)
+        if: needs.build.outputs.tools_ok == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.TOOLS_IMAGE }}
@@ -424,6 +439,7 @@ jobs:
 
       # The tag Arcane pulls: each Windows host gets the tools image of its release.
       - name: Push tools multi-release index
+        if: needs.build.outputs.tools_ok == 'true'
         env:
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
@@ -472,6 +488,7 @@ jobs:
           push-to-registry: true
 
       - name: Image attestation (tools multi-release index)
+        if: needs.build.outputs.tools_ok == 'true'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ env.TOOLS_IMAGE }}
